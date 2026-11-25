@@ -1,0 +1,8589 @@
+-- Just Indicator Is Update 
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
+local TextService = game:GetService("TextService")
+local GuiService = game:GetService("GuiService")
+local Player = Players.LocalPlayer
+
+local REXXZY_DEVELOPER_USER_IDS = {
+    [10652722254] = true,
+}
+local REXXZY_DEVELOPER_TAG_TEXT = "🛠️ Developer"
+local REXXZY_DEVELOPER_TAG_MAX_DISTANCE = 180
+
+local RexxzyLogos = {
+    Veloria = "rbxassetid://131946786209484",
+    veloria = "rbxassetid://131946786209484",
+    Verlo = "rbxassetid://131946786209484",
+    verlo = "rbxassetid://131946786209484",
+    VH = "rbxassetid://131946786209484",
+    vh = "rbxassetid://131946786209484",
+}
+
+local function SafeGetExecutor()
+	if identifyexecutor then
+		local ok, v = pcall(identifyexecutor) if ok and v then return tostring(v) end
+	end
+	if getexecutorname then
+		local ok, v = pcall(getexecutorname) if ok and v then return tostring(v) end
+	end
+	return "Unknown"
+end
+
+local function GetISO8601()
+	local ok, t = pcall(function() return os.date("!%Y-%m-%dT%H:%M:%SZ") end)
+	return ok and t or "1970-01-01T00:00:00Z"
+end
+
+local function ColorInt(c)
+	return type(c) == "number" and c or 0xE6E6E6
+end
+
+local WebhookConfig = {}
+WebhookConfig.__index = WebhookConfig
+
+function WebhookConfig.new(name, cfg)
+	cfg = cfg or {}
+	local self = setmetatable({}, WebhookConfig)
+	self.Name = name or "Config"
+	self.Enabled = cfg.Enabled ~= false
+	self.URL = cfg.URL or ""
+	self.Username = cfg.Username or "Rexxzy"
+	self.AvatarURL = cfg.AvatarURL or ""
+	self.SendPlayer = cfg.SendPlayer ~= false
+	self.SendGame = cfg.SendGame ~= false
+	self.Timestamp = cfg.Timestamp ~= false
+	self.RateDelay = math.max(0, tonumber(cfg.RateDelay) or 2)
+	self.QueueMax = math.max(1, math.floor(tonumber(cfg.QueueMax) or 50))
+	self.Color = cfg.Color or 0xE6E6E6
+	self._queue = {}
+	self._events = {}
+	self._listeners = {}
+	self._stats = { sent = 0, failed = 0, dropped = 0 }
+	self._lastSent = 0
+	self._processing = false
+	self._running = true
+	self._playerCache = nil
+	self._gameCache = nil
+	self:_StartWorker()
+	return self
+end
+
+function WebhookConfig:_CanSend()
+	if not self.Enabled then return false end
+	if self.URL == "" then return false end
+	local f = syn and syn.request or (http and http.request) or request or http_request
+	return f ~= nil
+end
+
+function WebhookConfig:_GetPlayer()
+	if self._playerCache then return self._playerCache end
+	local ok, r = pcall(function()
+		return { Username = Player.Name, DisplayName = Player.DisplayName, UserId = Player.UserId }
+	end)
+	self._playerCache = ok and r or { Username = "?", DisplayName = "?", UserId = 0 }
+	return self._playerCache
+end
+
+function WebhookConfig:_GetGame()
+	if self._gameCache then return self._gameCache end
+	local ok, r = pcall(function()
+		return { PlaceId = game.PlaceId, JobId = game.JobId, Executor = SafeGetExecutor() }
+	end)
+	self._gameCache = ok and r or { PlaceId = 0, JobId = "?", Executor = "?" }
+	return self._gameCache
+end
+
+function WebhookConfig:_BuildFields(data)
+	local fields = {}
+	if type(data) == "table" then
+		for k, v in pairs(data) do
+			if #fields >= 19 then break end
+			if type(k) == "string" and type(v) ~= "table" and type(v) ~= "function" then
+				local Value = tostring(v):gsub("```", "'''"):sub(1, 1000)
+				table.insert(fields, { name = tostring(k):sub(1, 256), value = "```" .. Value .. "```", inline = true })
+			end
+		end
+	end
+	if self.SendPlayer then
+		local p = self:_GetPlayer()
+		table.insert(fields, { name = "Username", value = p.Username .. " (" .. p.DisplayName .. ")", inline = true })
+		table.insert(fields, { name = "User ID", value = "```" .. tostring(p.UserId) .. "```", inline = true })
+		local ok, url = pcall(function()
+			return Players:GetUserThumbnailAsync(p.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		end)
+		if ok and url then
+			table.insert(fields, { name = "Avatar", value = "[View](" .. url .. ")", inline = true })
+		end
+	end
+	if self.SendGame then
+		local g = self:_GetGame()
+		table.insert(fields, { name = "Place ID", value = "```" .. tostring(g.PlaceId) .. "```", inline = true })
+		table.insert(fields, { name = "Job ID", value = "```" .. tostring(g.JobId):sub(1, 18) .. "...```", inline = true })
+		if g.Executor ~= "Unknown" then
+			table.insert(fields, { name = "Executor", value = "```" .. g.Executor .. "```", inline = true })
+		end
+	end
+	return fields
+end
+
+function WebhookConfig:_DoPost(payload)
+	local f = syn and syn.request or (http and http.request) or request or http_request
+	if not f then self._stats.failed = self._stats.failed + 1 return false end
+	local ok, body = pcall(HttpService.JSONEncode, HttpService, payload)
+	if not ok then self._stats.failed = self._stats.failed + 1 return false end
+	local s, r = pcall(function()
+		return f({ Url = self.URL, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+	end)
+	if not s then self._stats.failed = self._stats.failed + 1 return false end
+	local code = r and (r.StatusCode or r.status_code)
+	if code and code >= 400 then self._stats.failed = self._stats.failed + 1 return false end
+	self._stats.sent = self._stats.sent + 1
+	return true
+end
+
+function WebhookConfig:_Enqueue(payload)
+	if #self._queue >= self.QueueMax then self._stats.dropped = self._stats.dropped + 1 return false end
+	table.insert(self._queue, payload)
+	return true
+end
+
+function WebhookConfig:_StartWorker()
+	task.spawn(function()
+		while self._running do
+			task.wait(0.5)
+			if not self._running then break end
+			if #self._queue > 0 and not self._processing then
+				if (tick() - self._lastSent) >= self.RateDelay then
+					self._processing = true
+					local item = table.remove(self._queue, 1)
+					if item then
+						local ok = pcall(function() self:_DoPost(item) end)
+						if not ok then self._stats.failed = self._stats.failed + 1 end
+					end
+					self._lastSent = tick()
+					self._processing = false
+				end
+			end
+		end
+	end)
+end
+
+function WebhookConfig:_FireListeners(event, data)
+	local list = self._listeners[event]
+	if list then for _, cb in ipairs(list) do pcall(cb, data) end end
+	local any = self._listeners["*"]
+	if any then for _, cb in ipairs(any) do pcall(cb, event, data) end end
+end
+
+function WebhookConfig:_MakePayload(embed)
+	local p = { username = self.Username, embeds = { embed } }
+	if self.AvatarURL ~= "" then p.avatar_url = self.AvatarURL end
+	return p
+end
+
+function WebhookConfig:RegisterEvent(name, tpl)
+	tpl = tpl or {}
+	self._events[name] = { title = tpl.title or tpl.Title or name, color = tpl.color or tpl.Color or self.Color }
+end
+
+function WebhookConfig:On(event, cb)
+	if not self._listeners[event] then self._listeners[event] = {} end
+	table.insert(self._listeners[event], cb)
+end
+
+function WebhookConfig:Send(event, data)
+	if not self:_CanSend() then return false end
+	self:_FireListeners(event, data)
+	local tpl = self._events[event] or { title = tostring(event), color = self.Color }
+	local embed = { title = tpl.title, color = ColorInt(tpl.color), fields = self:_BuildFields(data) }
+	if self.Timestamp then embed.timestamp = GetISO8601() end
+	return self:_Enqueue(self:_MakePayload(embed))
+end
+
+function WebhookConfig:SendEmbed(tbl)
+	if not self:_CanSend() or type(tbl) ~= "table" then return false end
+	local embed = {
+		title = tbl.Title or tbl.title or "Embed",
+		description = tbl.Description or tbl.description or "",
+		color = ColorInt(tbl.Color or tbl.color or self.Color),
+		fields = tbl.Fields or tbl.fields or {},
+	}
+	if tbl.Footer or tbl.footer then embed.footer = { text = tbl.Footer or tbl.footer } end
+	if tbl.Author or tbl.author then embed.author = { name = tbl.Author or tbl.author } end
+	if tbl.Thumbnail or tbl.thumbnail then embed.thumbnail = { url = tbl.Thumbnail or tbl.thumbnail } end
+	if tbl.Image or tbl.image then embed.image = { url = tbl.Image or tbl.image } end
+	if self.Timestamp then embed.timestamp = GetISO8601() end
+	return self:_Enqueue(self:_MakePayload(embed))
+end
+
+function WebhookConfig:SendEmbeds(list)
+	if not self:_CanSend() or type(list) ~= "table" then return false end
+	local embeds = {}
+	for i, tbl in ipairs(list) do
+		if i > 10 then break end
+		local e = {
+			title = tbl.Title or tbl.title or ("Embed " .. i),
+			description = tbl.Description or tbl.description or "",
+			color = ColorInt(tbl.Color or tbl.color or self.Color),
+			fields = tbl.Fields or tbl.fields or {},
+		}
+		if self.Timestamp then e.timestamp = GetISO8601() end
+		table.insert(embeds, e)
+	end
+	local p = { username = self.Username, embeds = embeds }
+	if self.AvatarURL ~= "" then p.avatar_url = self.AvatarURL end
+	return self:_Enqueue(p)
+end
+
+function WebhookConfig:SendRaw(payload)
+	if not self:_CanSend() or type(payload) ~= "table" then return false end
+	return self:_Enqueue(payload)
+end
+
+function WebhookConfig:SendContent(text)
+	if not self:_CanSend() then return false end
+	return self:_Enqueue({ username = self.Username, content = tostring(text) })
+end
+
+function WebhookConfig:Flush()
+	if not self._running or self._flushing then return false end
+	self._flushing = true
+	task.spawn(function()
+		while self._running and #self._queue > 0 do
+			if self._processing then
+				task.wait(0.1)
+			else
+				local WaitFor = math.max(0, (tonumber(self.RateDelay) or 2) - (tick() - self._lastSent))
+				if WaitFor > 0 then
+					task.wait(math.min(WaitFor, 0.25))
+				else
+					self._processing = true
+					local item = table.remove(self._queue, 1)
+					if item then
+						local ok = pcall(function() self:_DoPost(item) end)
+						if not ok then self._stats.failed = self._stats.failed + 1 end
+					end
+					self._lastSent = tick()
+					self._processing = false
+				end
+			end
+		end
+		self._flushing = false
+	end)
+	return true
+end
+
+function WebhookConfig:ClearQueue()
+	self._stats.dropped = self._stats.dropped + #self._queue
+	self._queue = {}
+end
+
+function WebhookConfig:GetStats()
+	return { sent = self._stats.sent, failed = self._stats.failed, queued = #self._queue, dropped = self._stats.dropped }
+end
+
+function WebhookConfig:GetPlayerInfo() return self:_GetPlayer() end
+function WebhookConfig:GetGameInfo() return self:_GetGame() end
+
+function WebhookConfig:Configure(cfg)
+	if type(cfg) ~= "table" then return false end
+	for k, v in pairs(cfg) do self[k] = v end
+	if cfg.RateDelay ~= nil then self.RateDelay = math.max(0, tonumber(cfg.RateDelay) or 2) end
+	if cfg.QueueMax ~= nil then self.QueueMax = math.max(1, math.floor(tonumber(cfg.QueueMax) or 50)) end
+	return true
+end
+
+function WebhookConfig:Destroy()
+	self._running = false
+	self._queue = {}
+	return true
+end
+
+function WebhookConfig:SetEnabled(b) self.Enabled = b == true end
+function WebhookConfig:SetURL(u) self.URL = u or "" end
+
+local RexxzyWebhook = {}
+RexxzyWebhook._configs = {}
+
+function RexxzyWebhook:NewConfig(name, cfg)
+	name = tostring(name or "Default")
+	local previous = self._configs[name]
+	if previous and previous.Destroy then previous:Destroy() end
+	local c = WebhookConfig.new(name, cfg)
+	self._configs[name] = c
+	return c
+end
+
+function RexxzyWebhook:Get(name)
+	return self._configs[name]
+end
+
+function RexxzyWebhook:AttachToLibrary(lib, configNameOrObj)
+	local cfg = type(configNameOrObj) == "string" and self._configs[configNameOrObj] or configNameOrObj
+	if not cfg or not lib then return end
+	if lib.SetNotification then
+		local orig = lib.SetNotification
+		lib.SetNotification = function(libSelf, c)
+			local text = c.Content or c[1] or ""
+			if text ~= "" then cfg:Send("Notification", { message = text }) end
+			return orig(libSelf, c)
+		end
+	end
+end
+
+local Theme = {
+	-- Clean monochrome palette inspired by the KittenHub reference.
+	Accent = Color3.fromRGB(245, 245, 247),
+	AccentSoft = Color3.fromRGB(194, 194, 199),
+	Dark = Color3.fromRGB(4, 4, 5),
+	Panel = Color3.fromRGB(9, 9, 11),
+	Field = Color3.fromRGB(17, 17, 20),
+	Text = Color3.fromRGB(245, 245, 247),
+	Sub = Color3.fromRGB(155, 155, 162),
+	Off = Color3.fromRGB(36, 36, 41),
+	Hover = Color3.fromRGB(25, 25, 29),
+	Selected = Color3.fromRGB(31, 31, 36),
+	Border = Color3.fromRGB(76, 76, 83),
+	Red = Color3.fromRGB(54, 54, 60),
+	RedHover = Color3.fromRGB(76, 76, 83),
+	White = Color3.fromRGB(238, 238, 242),
+	Black = Color3.fromRGB(5, 5, 7),
+}
+
+local Custom = {}
+do
+	Custom.ColorRGB = Theme.Accent
+	Custom.Theme = Theme
+	Custom.DefaultIcon = "rbxassetid://18505728250"
+	Custom.GradientWhite = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(248, 249, 252)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(202, 205, 213)),
+	})
+	Custom.GradientBorder = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+		ColorSequenceKeypoint.new(0.25, Color3.fromRGB(40, 40, 40)),
+		ColorSequenceKeypoint.new(0.5, Color3.fromRGB(210, 210, 210)),
+		ColorSequenceKeypoint.new(0.75, Color3.fromRGB(40, 40, 40)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 255, 255)),
+	})
+	Custom.GradientWindow = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(9, 11, 15)),
+		ColorSequenceKeypoint.new(0.55, Color3.fromRGB(11, 13, 17)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 18, 23)),
+	})
+	Custom.GradientLine = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(140, 140, 140)),
+	})
+	Custom.FadeEnds = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 1),
+		NumberSequenceKeypoint.new(0.5, 0),
+		NumberSequenceKeypoint.new(1, 1),
+	})
+
+	function Custom:Create(Name, Props, Parent)
+		local inst = Instance.new(Name)
+		for k, v in pairs(Props) do inst[k] = v end
+		
+		if Name == "TextLabel" or Name == "TextButton" or Name == "TextBox" then
+			if Props.ClipsDescendants == nil then inst.ClipsDescendants = true end
+			if Name ~= "TextBox" and Props.TextWrapped ~= true and Props.TextTruncate == nil then
+				pcall(function() inst.TextTruncate = Enum.TextTruncate.AtEnd end)
+			end
+		end
+		if Parent then inst.Parent = Parent end
+		return inst
+	end
+
+	function Custom:EnabledAFK()
+		Player.Idled:Connect(function()
+			VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+			task.wait(1)
+			VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+		end)
+	end
+
+	-- Flat visual mode: keep the public helper/API, but render a single solid tone.
+	function Custom:AddGradient(inst, Rotation, Colors)
+		local FlatColor = Theme.White
+		if typeof(Colors) == "ColorSequence" and Colors.Keypoints and Colors.Keypoints[1] then
+			FlatColor = Colors.Keypoints[1].Value
+		end
+		return Custom:Create("UIGradient", { Color = ColorSequence.new(FlatColor), Rotation = 0 }, inst)
+	end
+
+	function Custom:Corner(inst, Radius)
+		return Custom:Create("UICorner", { CornerRadius = UDim.new(0, Radius or 8) }, inst)
+	end
+
+	function Custom:Round(inst)
+		return Custom:Create("UICorner", { CornerRadius = UDim.new(1, 0) }, inst)
+	end
+
+	function Custom:Stroke(inst, Color, Transparency, Thickness)
+		return Custom:Create("UIStroke", {
+			
+			Color = Color or Theme.White,
+			Transparency = type(Transparency) == "number" and math.clamp(Transparency, 0, 0.85) or 0.28,
+			Thickness = Thickness or 1,
+			ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+		}, inst)
+	end
+
+	-- Static interaction mode: properties update immediately; a zero-duration Tween
+	-- object is returned so existing code using Completed:Wait() remains compatible.
+	function Custom:Tween(inst, Time, Props, Style, Direction)
+		if not inst or not inst.Parent or type(Props) ~= "table" then return nil end
+		local Ok, Tw = pcall(function()
+			return TweenService:Create(inst, TweenInfo.new(0, Enum.EasingStyle.Linear, Enum.EasingDirection.Out), Props)
+		end)
+		if Ok and Tw then
+			Tw:Play()
+			return Tw
+		end
+		for Property, Value in pairs(Props) do pcall(function() inst[Property] = Value end) end
+		return nil
+	end
+
+	function Custom:Label(Parent, Props)
+		local base = {
+			Font = Enum.Font.GothamBold, TextColor3 = Theme.Text, TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Left, BackgroundTransparency = 1, BorderSizePixel = 0,
+			ClipsDescendants = true,
+		}
+		for k, v in pairs(Props) do base[k] = v end
+		if base.TextWrapped ~= true and base.TextTruncate == nil then
+			base.TextTruncate = Enum.TextTruncate.AtEnd
+		end
+		return Custom:Create("TextLabel", base, Parent)
+	end
+
+	function Custom:Card(Parent, Height, Name, Clickable)
+		-- Controls are rendered as clean rows inside the section container.
+		-- The section owns the outer border; each row only receives a subtle hover state.
+		local Card = Custom:Create(Clickable and "TextButton" or "Frame", {
+			BackgroundColor3 = Theme.White, BackgroundTransparency = 1, BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 0, Height), Name = Name,
+		}, nil)
+		if Clickable then
+			Card.AutoButtonColor = false
+			Card.Text = ""
+		end
+		Custom:Corner(Card, 8)
+		local Stroke = Custom:Stroke(Card, Theme.White, 1, 1)
+		Card.Parent = Parent
+		return Card, Stroke
+	end
+
+	function Custom:Hover(Card, Stroke)
+		local BaseColor = Card.BackgroundColor3
+		local BaseTransparency = Card.BackgroundTransparency
+		local BaseStrokeColor = Stroke and Stroke.Color
+		local BaseStrokeTransparency = Stroke and Stroke.Transparency
+		Card.MouseEnter:Connect(function()
+			Custom:Tween(Card, 0.14, {
+				BackgroundColor3 = Theme.Hover,
+				BackgroundTransparency = math.min(BaseTransparency, 0.02),
+			})
+			if Stroke then
+				Custom:Tween(Stroke, 0.14, { Color = Theme.White, Transparency = 0.52 })
+			end
+		end)
+		Card.MouseLeave:Connect(function()
+			Custom:Tween(Card, 0.16, {
+				BackgroundColor3 = BaseColor,
+				BackgroundTransparency = BaseTransparency,
+			})
+			if Stroke then
+				Custom:Tween(Stroke, 0.16, {
+					Color = BaseStrokeColor,
+					Transparency = BaseStrokeTransparency,
+				})
+			end
+		end)
+	end
+
+	-- Deliberately no highlight pulse or temporary glow in the static UI.
+	function Custom:Highlight(Frame)
+		return false
+	end
+
+	function Custom:GetGuiParent()
+		if RunService:IsStudio() then return Player.PlayerGui end
+		if gethui then local ok, r = pcall(gethui) if ok and r then return r end end
+		if cloneref then local ok, r = pcall(function() return cloneref(game:GetService("CoreGui")) end) if ok and r then return r end end
+		return game:GetService("CoreGui")
+	end
+
+	function Custom:Decimals(n)
+		local d = 0
+		while d < 6 and math.abs(n * 10 ^ d - math.floor(n * 10 ^ d + 0.5)) > 1e-7 do d = d + 1 end
+		return d
+	end
+end
+
+Custom:EnabledAFK()
+
+-- Ripple click effects are disabled; button actions remain fully functional.
+local function CircleClick(Button, X, Y)
+	return false
+end
+local HttpFetch 
+local Icons = {}
+Icons.Remote = {}
+Icons.RemoteFailureAt = {}
+Icons.RemoteEnabled = true
+Icons.Data = {
+["activity"]="M3 12.5h4l2.5-7l4.5 13l2.5-6H21",
+["adjustments"]="M5 6L10 6M14 6L19 6M14 6A2 2 0 1 1 10 6A2 2 0 1 1 14 6ZM5 12L6 12M10 12L19 12M10 12A2 2 0 1 1 6 12A2 2 0 1 1 10 12ZM5 18L14 18M18 18L19 18M18 18A2 2 0 1 1 14 18A2 2 0 1 1 18 18Z",
+["airplane-mode"]="M20.5 5L3.5 11.7l6 2.8l2.8 6ZM9.5 14.5L20.5 5",
+["alert-circle"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM12 7.8L12 12.5D12 16 0.6",
+["alert-octagon"]="M8.7 3.8h6.6l4.9 4.9v6.6l-4.9 4.9H8.7l-4.9-4.9V8.7ZM12 8.2L12 12.5D12 15.8 0.6",
+["alert-triangle"]="M10.6 4.8L3.7 17a1.6 1.6 0 0 0 1.4 2.4h13.8a1.6 1.6 0 0 0 1.4-2.4L13.4 4.8a1.6 1.6 0 0 0-2.8 0ZM12 9.8L12 13.8D12 16.6 0.6",
+["ambulance"]="M3 6.5a1.5 1.5 0 0 1 1.5-1.5h8A1.5 1.5 0 0 1 14 6.5V16H3ZM14 9.5h3.5l3 3.5V16H14ZM9 17.5A2 2 0 1 1 5 17.5A2 2 0 1 1 9 17.5ZM18.5 17.5A2 2 0 1 1 14.5 17.5A2 2 0 1 1 18.5 17.5ZM8.5 7.5L8.5 12.5M6 10L11 10",
+["anchor"]="M14 5.5A2 2 0 1 1 10 5.5A2 2 0 1 1 14 5.5ZM12 7.5L12 20M8 11L16 11M4 14c0.5 3.5 3.5 6 8 6s7.5-2.5 8-6M4 14l1.8 1.2M20 14l-1.8 1.2",
+["api"]="M8.3 6A2.3 2.3 0 1 1 3.7 6A2.3 2.3 0 1 1 8.3 6ZM20.3 18A2.3 2.3 0 1 1 15.7 18A2.3 2.3 0 1 1 20.3 18ZM8.3 6H15a3 3 0 0 1 0 6H9a3 3 0 0 0 0 6h6.7M15.5 3.8L18 6l-2.5 2.2",
+["archive"]="M4.9 4.5H19.1A1.4 1.4 0 0 1 20.5 5.9V7.6A1.4 1.4 0 0 1 19.1 9H4.9A1.4 1.4 0 0 1 3.5 7.6V5.9A1.4 1.4 0 0 1 4.9 4.5ZM5 9v8.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M9.8 13L14.2 13",
+["armor"]="M7 4.5C8.5 6 15.5 6 17 4.5L19.5 7V12c0 4.5-3 7.5-7.5 9c-4.5-1.5-7.5-4.5-7.5-9V7ZM12 7.5L12 20.5M8 11.5c1.5 0.8 2.7 1.2 4 1.2s2.5-0.4 4-1.2",
+["arrow-down"]="M12 4.5L12 19.5M18 13.8L12 19.5L6 13.8",
+["arrow-down-left"]="M17.5 6.5L6.5 17.5M15.2 17.5H6.5V8.8",
+["arrow-left"]="M19.5 12L4.5 12M10.2 18L4.5 12L10.2 6",
+["arrow-right"]="M4.5 12L19.5 12M13.8 6L19.5 12L13.8 18",
+["arrow-up"]="M12 19.5L12 4.5M6 10.2L12 4.5L18 10.2",
+["arrow-up-right"]="M6.5 17.5L17.5 6.5M8.8 6.5h8.7v8.7",
+["at-sign"]="M15.6 12A3.6 3.6 0 1 1 8.4 12A3.6 3.6 0 1 1 15.6 12ZM15.6 8.5v5a2.5 2.5 0 0 0 5 0V12a8.6 8.6 0 1 0-3.4 6.8",
+["aura"]="M14.6 10A2.6 2.6 0 1 1 9.4 10A2.6 2.6 0 1 1 14.6 10ZM7.3 18c0.7-2.2 2.3-3.2 4.7-3.2s4 1 4.7 3.2M4 12.5a8.5 8.5 0 0 1 3-7M20 12.5a8.5 8.5 0 0 0-3-7M7.5 20a8.5 8.5 0 0 0 9 0",
+["auto-farm"]="M5 12a7 7 0 0 1 12-4.9M19 12a7 7 0 0 1-12 4.9M17.5 4v3.2h-3.2M6.5 20v-3.2h3.2M12 14.5L12 10M12 10c0-1.7-1.1-2.6-3-2.6c0 1.7 1.1 2.6 3 2.6ZM12 11.8c0-1.5 1-2.4 2.8-2.4c0 1.5-1 2.4-2.8 2.4Z",
+["avatar"]="M8 4H16A4 4 0 0 1 20 8V16A4 4 0 0 1 16 20H8A4 4 0 0 1 4 16V8A4 4 0 0 1 8 4ZM14.8 10.2A2.8 2.8 0 1 1 9.2 10.2A2.8 2.8 0 1 1 14.8 10.2ZM7 18c0.9-2.2 2.6-3.2 5-3.2s4.1 1 5 3.2",
+["back-to-top"]="M5 4.5L19 4.5M12 19.5L12 9.5M7 13.5L12 8.5l5 5",
+["backpack"]="M7 9a5 5 0 0 1 10 0v9.5a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2ZM10 4.5V4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v0.5M10.4 13H13.6A1.2 1.2 0 0 1 14.8 14.2V16.3A1.2 1.2 0 0 1 13.6 17.5H10.4A1.2 1.2 0 0 1 9.2 16.3V14.2A1.2 1.2 0 0 1 10.4 13ZM7 10.5L17 10.5",
+["badge-check"]="M12 3.5l2.2 1.7l2.7-0.2l1 2.6l2.3 1.5l-0.9 2.6l0.9 2.6l-2.3 1.5l-1 2.6l-2.7-0.2L12 20.5l-2.2-1.7l-2.7 0.2l-1-2.6l-2.3-1.5l0.9-2.6l-0.9-2.6L6.1 7.7l1-2.6l2.7 0.2ZM8.8 12.1l2.3 2.3l4.2-4.5",
+["badge-dollar"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM14.5 9.3c-0.3-1-1.3-1.5-2.5-1.5c-1.5 0-2.5 0.7-2.5 1.7c0 2.5 5 1 5 3.5c0 1-1 1.7-2.5 1.7s-2.3-0.6-2.6-1.5M12 6.5L12 7.8M12 16.2L12 17.5",
+["ban"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM6 6L18 18",
+["bank"]="M3.5 9L12 4l8.5 5ZM5.5 20L18.5 20M6.5 11.5L6.5 17M10.2 11.5L10.2 17M13.8 11.5L13.8 17M17.5 11.5L17.5 17",
+["banknote"]="M5.4 6H18.6A2.6 2.6 0 0 1 21.2 8.6V15.4A2.6 2.6 0 0 1 18.6 18H5.4A2.6 2.6 0 0 1 2.8 15.4V8.6A2.6 2.6 0 0 1 5.4 6ZM14.6 12A2.6 2.6 0 1 1 9.4 12A2.6 2.6 0 1 1 14.6 12ZM6 12L6 12.1M18 12L18 12.1",
+["bar-chart"]="M5.7 12H6.8A1.2 1.2 0 0 1 8 13.2V18.8A1.2 1.2 0 0 1 6.8 20H5.7A1.2 1.2 0 0 1 4.5 18.8V13.2A1.2 1.2 0 0 1 5.7 12ZM11.4 5H12.6A1.2 1.2 0 0 1 13.8 6.2V18.8A1.2 1.2 0 0 1 12.6 20H11.4A1.2 1.2 0 0 1 10.2 18.8V6.2A1.2 1.2 0 0 1 11.4 5ZM17.2 9H18.3A1.2 1.2 0 0 1 19.5 10.2V18.8A1.2 1.2 0 0 1 18.3 20H17.2A1.2 1.2 0 0 1 16 18.8V10.2A1.2 1.2 0 0 1 17.2 9Z",
+["battery"]="M5.4 7.5H16.6A2.4 2.4 0 0 1 19 9.9V14.1A2.4 2.4 0 0 1 16.6 16.5H5.4A2.4 2.4 0 0 1 3 14.1V9.9A2.4 2.4 0 0 1 5.4 7.5ZM21.5 10.8L21.5 13.2M6.5 11L6.5 13M9.8 11L9.8 13M13.1 11L13.1 13",
+["battery-charging"]="M7.5 7.5H5.4A2.4 2.4 0 0 0 3 9.9v4.2a2.4 2.4 0 0 0 2.4 2.4H7M15 7.5h1.6A2.4 2.4 0 0 1 19 9.9v4.2a2.4 2.4 0 0 1-2.4 2.4H14.5M21.5 10.8L21.5 13.2M11.8 6.8L9.2 12h5.6l-2.6 5.2",
+["bell"]="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5H4.5ZM10 20.5a2.2 2.2 0 0 0 4 0",
+["bell-off"]="M8.2 6A6 6 0 0 1 18 11v4M6 11v5.5L4.5 18H15M10 20.5a2.2 2.2 0 0 0 4 0M4 4L20 20",
+["bell-ring"]="M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 1.5H4.5ZM10 20.5a2.2 2.2 0 0 0 4 0M3.5 9.5A9 9 0 0 1 5.8 5M20.5 9.5A9 9 0 0 0 18.2 5",
+["bike"]="M9.5 16A3.5 3.5 0 1 1 2.5 16A3.5 3.5 0 1 1 9.5 16ZM21.5 16A3.5 3.5 0 1 1 14.5 16A3.5 3.5 0 1 1 21.5 16ZM6 16l3-7h5.5l3.5 7M9 9L12 16M14.5 9l-1-3H16M8 6.5L10.5 6.5",
+["binary"]="M8.5 4.5a2 2 0 0 1 2 2v3a2 2 0 0 1-4 0v-3a2 2 0 0 1 2-2ZM15 4.5v5M13.5 6l1.5-1.5M8 14.5v5M6.5 16L8 14.5M15.5 14.5a2 2 0 0 1 2 2v1a2 2 0 0 1-4 0v-1a2 2 0 0 1 2-2Z",
+["bird"]="M20.5 6.5c-1.5 0.2-2.5-0.1-3.4-1A3.5 3.5 0 0 0 11 7.5c0 1-0.2 2-0.8 2.8c-1.5 2-3.3 3.2-6.2 3.2c2 3 5 5 8.5 5c4.5 0 7.5-3.3 7.5-7.8ZD15.2 7.8 0.8M20.5 6.5L22 8",
+["blocks"]="M5.4 13.5H9.1A1.4 1.4 0 0 1 10.5 14.9V18.6A1.4 1.4 0 0 1 9.1 20H5.4A1.4 1.4 0 0 1 4 18.6V14.9A1.4 1.4 0 0 1 5.4 13.5ZM14.9 13.5H18.6A1.4 1.4 0 0 1 20 14.9V18.6A1.4 1.4 0 0 1 18.6 20H14.9A1.4 1.4 0 0 1 13.5 18.6V14.9A1.4 1.4 0 0 1 14.9 13.5ZM5.4 4H9.1A1.4 1.4 0 0 1 10.5 5.4V9.1A1.4 1.4 0 0 1 9.1 10.5H5.4A1.4 1.4 0 0 1 4 9.1V5.4A1.4 1.4 0 0 1 5.4 4ZM16.8 3.5l3.2 3.2l-3.2 3.2l-3.2-3.2Z",
+["bluetooth"]="M7 7.5l10 9l-5 4.3V3.2l5 4.3l-10 9",
+["bomb"]="M17 13.5A6.5 6.5 0 1 1 4 13.5A6.5 6.5 0 1 1 17 13.5ZM15.2 8.8L17 7M17 7l0.8-1.8M17 7l2 0.3M17 7l1.2-1.5M7 12.5L8.2 11",
+["book"]="M4.5 5.5a1.5 1.5 0 0 1 1.5-1.5H18a1.5 1.5 0 0 1 1.5 1.5v12.5H6.5a2 2 0 0 0-2 2ZM4.5 20a2 2 0 0 1 2-2h13V20ZM9 8.5L15 8.5",
+["book-open"]="M12 6.5c-1.5-1.6-4-2.3-7.5-2.3V17c3.5 0 6 0.7 7.5 2.3c1.5-1.6 4-2.3 7.5-2.3V4.2c-3.5 0-6 0.7-7.5 2.3ZM12 6.5L12 19.3",
+["bookmark"]="M6.5 4.5h11a1 1 0 0 1 1 1V20l-6.5-4.3L5.5 20V5.5a1 1 0 0 1 1-1Z",
+["bookmark-check"]="M6.5 4.5h11a1 1 0 0 1 1 1V20l-6.5-4.3L5.5 20V5.5a1 1 0 0 1 1-1ZM9.5 10l1.8 1.8l3.2-3.4",
+["boots"]="M7.5 3.5h6V10l4.5 2.2a2.8 2.8 0 0 1 1.5 2.5V17a1.5 1.5 0 0 1-1.5 1.5H7.5a1.5 1.5 0 0 1-1.5-1.5V5a1.5 1.5 0 0 1 1.5-1.5ZM6 15.5L19.5 15.5",
+["bow"]="M6 4c10 0.5 14.5 6 14 16M6 4L20 20M11 13L20 4M16 4h4v4",
+["box"]="M12 3.5L19.8 7.8v8.4L12 20.5L4.2 16.2V7.8ZM4.5 8L12 12.2L19.5 8M12 12.2L12 20.3",
+["braces"]="M9 4.5C7 4.5 6.5 5.5 6.5 7v2.5c0 1.2-0.8 2-2 2.5c1.2 0.5 2 1.3 2 2.5V17c0 1.5 0.5 2.5 2.5 2.5M15 4.5c2 0 2.5 1 2.5 2.5v2.5c0 1.2 0.8 2 2 2.5c-1.2 0.5-2 1.3-2 2.5V17c0 1.5-0.5 2.5-2.5 2.5",
+["bracket-square"]="M9 4.5H6.5a1 1 0 0 0-1 1v13a1 1 0 0 0 1 1H9M15 4.5h2.5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1H15",
+["bug"]="M8.5 9a3.5 3.5 0 0 1 7 0v1H8.5ZM8.5 10h7v5.5a3.5 3.5 0 0 1-7 0ZM12 10L12 19M3.5 11.5L6.5 13M20.5 11.5L17.5 13M3.5 18.5L6.5 16.5M20.5 18.5L17.5 16.5M4.5 7.5L8 9.2M19.5 7.5L16 9.2M9.2 5.5L8 3.8M14.8 5.5L16 3.8",
+["bus"]="M7.5 3.5H16.5A3 3 0 0 1 19.5 6.5V15A3 3 0 0 1 16.5 18H7.5A3 3 0 0 1 4.5 15V6.5A3 3 0 0 1 7.5 3.5ZM4.5 11L19.5 11M9.5 3.5L9.5 11D8 14.5 0.9D16 14.5 0.9M7 18L7 20.5M17 18L17 20.5",
+["cactus"]="M9.5 20.5V6.5a2.5 2.5 0 0 1 5 0v14ZM9.5 14H7.5A2 2 0 0 1 5.5 12V9.5M14.5 12h2a2 2 0 0 0 2-2V8M7 20.5L17 20.5",
+["calculator"]="M7.8 3.5H16.2A2.8 2.8 0 0 1 19 6.3V17.7A2.8 2.8 0 0 1 16.2 20.5H7.8A2.8 2.8 0 0 1 5 17.7V6.3A2.8 2.8 0 0 1 7.8 3.5ZM8.8 6.5H15.2A0.8 0.8 0 0 1 16 7.3V9.2A0.8 0.8 0 0 1 15.2 10H8.8A0.8 0.8 0 0 1 8 9.2V7.3A0.8 0.8 0 0 1 8.8 6.5ZD8.5 14 0.9D12 14 0.9D15.5 14 0.9D8.5 17.5 0.9D12 17.5 0.9D15.5 17.5 0.9",
+["calendar"]="M6.4 5.5H17.6A2.6 2.6 0 0 1 20.2 8.1V17.4A2.6 2.6 0 0 1 17.6 20H6.4A2.6 2.6 0 0 1 3.8 17.4V8.1A2.6 2.6 0 0 1 6.4 5.5ZM3.8 10L20.2 10M8 3.5L8 7M16 3.5L16 7",
+["camera"]="M4.5 8h2.6l1.2-2.2a1 1 0 0 1 0.9-0.5h5.6a1 1 0 0 1 0.9 0.5L16.9 8h2.6a2 2 0 0 1 2 2v7.5a2 2 0 0 1-2 2h-15a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2ZM15.4 13.3A3.4 3.4 0 1 1 8.6 13.3A3.4 3.4 0 1 1 15.4 13.3Z",
+["camera-lock"]="M4 8.5h2.7l1.2-2h5.2l1.2 2H17M4 8.5v9a1.5 1.5 0 0 0 1.5 1.5H11.5M12.8 13.5A2.8 2.8 0 1 1 7.2 13.5A2.8 2.8 0 1 1 12.8 13.5ZM15.8 14.8H19.2A1.3 1.3 0 0 1 20.5 16.1V18.5A1.3 1.3 0 0 1 19.2 19.8H15.8A1.3 1.3 0 0 1 14.5 18.5V16.1A1.3 1.3 0 0 1 15.8 14.8ZM16 14.8v-1a1.5 1.5 0 0 1 3 0v1",
+["car"]="M5 16.5v-3.2a2 2 0 0 1 0.3-1l1.8-3.8a2 2 0 0 1 1.8-1.2h6.2a2 2 0 0 1 1.8 1.2l1.8 3.8a2 2 0 0 1 0.3 1v3.2a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1ZM5.2 12.5L18.8 12.5D8.5 15 0.9D15.5 15 0.9M7.5 17.5L7.5 19.5M16.5 17.5L16.5 19.5",
+["cards"]="M8.2 3.5H15.8A2.2 2.2 0 0 1 18 5.7V18.3A2.2 2.2 0 0 1 15.8 20.5H8.2A2.2 2.2 0 0 1 6 18.3V5.7A2.2 2.2 0 0 1 8.2 3.5ZM12 8.8l2.5 3.2l-2.5 3.2l-2.5-3.2Z",
+["cargo-ship"]="M3 15.5h18l-2.2 3.3a2 2 0 0 1-1.7 0.9H6.9a2 2 0 0 1-1.7-0.9ZM5.7 10.5H7.9A0.7 0.7 0 0 1 8.6 11.2V13.5A0.7 0.7 0 0 1 7.9 14.2H5.7A0.7 0.7 0 0 1 5 13.5V11.2A0.7 0.7 0 0 1 5.7 10.5ZM10.4 10.5H12.6A0.7 0.7 0 0 1 13.3 11.2V13.5A0.7 0.7 0 0 1 12.6 14.2H10.4A0.7 0.7 0 0 1 9.7 13.5V11.2A0.7 0.7 0 0 1 10.4 10.5ZM15.1 10.5H18.3A0.7 0.7 0 0 1 19 11.2V13.5A0.7 0.7 0 0 1 18.3 14.2H15.1A0.7 0.7 0 0 1 14.4 13.5V11.2A0.7 0.7 0 0 1 15.1 10.5ZM8.7 6.5H12.3A0.7 0.7 0 0 1 13 7.2V9A0.7 0.7 0 0 1 12.3 9.7H8.7A0.7 0.7 0 0 1 8 9V7.2A0.7 0.7 0 0 1 8.7 6.5ZM17 6.5L17 10.5",
+["cast"]="M4 17.5a2.5 2.5 0 0 1 2.5 2.5M4 13.5A6.5 6.5 0 0 1 10.5 20M4 9.5A10.5 10.5 0 0 1 14.5 20M4 6.5V6a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-1",
+["castle"]="M4.5 20.5V6h3v2h2V6h5v2h2V6h3v14.5ZM10 20.5v-4a2 2 0 0 1 4 0v4",
+["chat-dots"]="M4.5 19.5l1.1-3.7A8 8 0 1 1 9 18.9ZD8.5 12 1D12 12 1D15.5 12 1",
+["check"]="M4.8 12.6L9.6 17.4L19.2 7",
+["check-circle"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM8.3 12.3l2.6 2.6l4.8-5.3",
+["checkpoint"]="M8 3.5L8 16.5M8 4.5h9l-2 3.3l2 3.3H8M4 19a8 2.2 0 1 0 16 0a8 2.2 0 1 0-16 0Z",
+["chess-pawn"]="M15 7A3 3 0 1 1 9 7A3 3 0 1 1 15 7ZM9.8 10.5c0.3 2-0.3 4-2 5.5h8.4c-1.7-1.5-2.3-3.5-2-5.5M6.5 20L17.5 20M7.5 17.5L16.5 17.5",
+["chevron-down"]="M18 9.5L12 15.5L6 9.5",
+["chevron-left"]="M14.5 18L8.5 12L14.5 6",
+["chevron-right"]="M9.5 6L15.5 12L9.5 18",
+["chevron-up"]="M6 14.5L12 8.5L18 14.5",
+["chevrons-left"]="M18 7.5L13.5 12L18 16.5M11 7.5L6.5 12L11 16.5",
+["chevrons-right"]="M6 7.5L10.5 12L6 16.5M13 7.5l4.5 4.5l-4.5 4.5",
+["chevrons-up-down"]="M7.5 9.5L12 5l4.5 4.5M7.5 14.5L12 19l4.5-4.5",
+["circle-dot"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM14.8 12A2.8 2.8 0 1 1 9.2 12A2.8 2.8 0 1 1 14.8 12Z",
+["clipboard"]="M9 5H7.5a2 2 0 0 0-2 2v11.5a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H15M10.4 3.5H13.6A1.4 1.4 0 0 1 15 4.9V5.6A1.4 1.4 0 0 1 13.6 7H10.4A1.4 1.4 0 0 1 9 5.6V4.9A1.4 1.4 0 0 1 10.4 3.5Z",
+["clipboard-check"]="M9 5H7.5a2 2 0 0 0-2 2v11.5a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H15M10.4 3.5H13.6A1.4 1.4 0 0 1 15 4.9V5.6A1.4 1.4 0 0 1 13.6 7H10.4A1.4 1.4 0 0 1 9 5.6V4.9A1.4 1.4 0 0 1 10.4 3.5ZM9.2 13.5l2 2l3.6-3.8",
+["clipboard-paste"]="M9 5H7.5a2 2 0 0 0-2 2v11.5a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2H15M10.4 3.5H13.6A1.4 1.4 0 0 1 15 4.9V5.6A1.4 1.4 0 0 1 13.6 7H10.4A1.4 1.4 0 0 1 9 5.6V4.9A1.4 1.4 0 0 1 10.4 3.5ZM9 12L15 12M9 15.5L13 15.5",
+["clock"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM12 7.3V12l3.2 2",
+["clock-alert"]="M20.5 12A8.5 8.5 0 1 1 12 3.5M12 7.5V12l3 2M19 3.5L19 7D19 9.5 0.5",
+["cloud"]="M7 18.5a4.2 4.2 0 0 1-0.6-8.3A6 6 0 0 1 17.8 9.3A4.6 4.6 0 0 1 17.3 18.5Z",
+["cloud-download"]="M8 17.5a4 4 0 0 1-1.5-7.7A6 6 0 0 1 18 9.5a4.2 4.2 0 0 1 1 8M12 11L12 19.5M8.8 16.7L12 19.9l3.2-3.2",
+["cloud-file"]="M7 18.5a4 4 0 0 1-0.5-8A5.5 5.5 0 0 1 17 9.5a4.5 4.5 0 0 1 0.5 9ZM9.5 15.5L14.5 15.5",
+["cloud-lightning"]="M16.5 15.5a4.6 4.6 0 0 0 0.8-9.2A6 6 0 0 0 5.8 8.2A4.2 4.2 0 0 0 7.5 15.5M12.5 11L9.8 16h4l-2.3 4.5",
+["cloud-rain"]="M7 15.5a4.2 4.2 0 0 1-0.6-8.3A6 6 0 0 1 17.8 6.3A4.6 4.6 0 0 1 17.3 15.5ZM8.5 18L7.5 20.5M12.5 18L11.5 20.5M16.5 18L15.5 20.5",
+["cloud-snow"]="M7 15.5a4.2 4.2 0 0 1-0.6-8.3A6 6 0 0 1 17.8 6.3A4.6 4.6 0 0 1 17.3 15.5ZD8 19 1D12 20.5 1D16 19 1",
+["cloud-upload"]="M8 17.5a4 4 0 0 1-1.5-7.7A6 6 0 0 1 18 9.5a4.2 4.2 0 0 1 1 8M12 20L12 12M8.8 14.8L12 11.6l3.2 3.2",
+["code"]="M8 7L3.5 12L8 17M16 7l4.5 5l-4.5 5M13.5 5.5L10.5 18.5",
+["coin-xp"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM8 9.5L11 14.5M11 9.5L8 14.5M13.5 14.5V9.5h2a1.5 1.5 0 0 1 0 3h-2",
+["coins"]="M20.5 9A5.5 5.5 0 1 1 9.5 9A5.5 5.5 0 1 1 20.5 9ZM14.5 15A5.5 5.5 0 1 1 3.5 15A5.5 5.5 0 1 1 14.5 15ZM9 12.5v5M7.5 14l1.5-1.5",
+["command"]="M9 9V6.5A2.5 2.5 0 1 0 6.5 9ZM9 9h6M15 9V6.5A2.5 2.5 0 1 1 17.5 9ZM9 15H6.5A2.5 2.5 0 1 0 9 17.5ZM15 15h2.5a2.5 2.5 0 1 1-2.5 2.5ZM9 9v6M15 9v6",
+["compass"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM15.7 8.3L13.6 13.6L8.3 15.7L10.4 10.4Z",
+["console"]="M6.1 4.5H17.9A2.6 2.6 0 0 1 20.5 7.1V16.9A2.6 2.6 0 0 1 17.9 19.5H6.1A2.6 2.6 0 0 1 3.5 16.9V7.1A2.6 2.6 0 0 1 6.1 4.5ZM3.5 9L20.5 9D6.5 6.8 0.7D9 6.8 0.7M7.5 12.5L10 14.5L7.5 16.5M12 16.5L16 16.5",
+["container"]="M5 6.5H19A1.5 1.5 0 0 1 20.5 8V16A1.5 1.5 0 0 1 19 17.5H5A1.5 1.5 0 0 1 3.5 16V8A1.5 1.5 0 0 1 5 6.5ZM8 6.5L8 17.5M12 6.5L12 17.5M16 6.5L16 17.5",
+["contrast"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM12 3.4a8.6 8.6 0 0 1 0 17.2Z",
+["copy"]="M10.9 8.5H17.1A2.4 2.4 0 0 1 19.5 10.9V17.1A2.4 2.4 0 0 1 17.1 19.5H10.9A2.4 2.4 0 0 1 8.5 17.1V10.9A2.4 2.4 0 0 1 10.9 8.5ZM15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2",
+["corner-down-right"]="M5 4.5v6a3.5 3.5 0 0 0 3.5 3.5H19M14.5 9.5L19 14l-4.5 4.5",
+["cpu"]="M8.7 6.5H15.3A2.2 2.2 0 0 1 17.5 8.7V15.3A2.2 2.2 0 0 1 15.3 17.5H8.7A2.2 2.2 0 0 1 6.5 15.3V8.7A2.2 2.2 0 0 1 8.7 6.5ZM10.5 9.5H13.5A1 1 0 0 1 14.5 10.5V13.5A1 1 0 0 1 13.5 14.5H10.5A1 1 0 0 1 9.5 13.5V10.5A1 1 0 0 1 10.5 9.5ZM9.5 3.5L9.5 6.5M14.5 3.5L14.5 6.5M9.5 17.5L9.5 20.5M14.5 17.5L14.5 20.5M3.5 9.5L6.5 9.5M3.5 14.5L6.5 14.5M17.5 9.5L20.5 9.5M17.5 14.5L20.5 14.5",
+["credit-card"]="M5.8 5.5H18.2A2.8 2.8 0 0 1 21 8.3V15.7A2.8 2.8 0 0 1 18.2 18.5H5.8A2.8 2.8 0 0 1 3 15.7V8.3A2.8 2.8 0 0 1 5.8 5.5ZM3 10L21 10M6.8 14.5L10 14.5",
+["crosshair"]="M18.5 12A6.5 6.5 0 1 1 5.5 12A6.5 6.5 0 1 1 18.5 12ZM12 3L12 8M12 16L12 21M3 12L8 12M16 12L21 12",
+["crown"]="M3.8 8.5L7.5 12L12 5.5L16.5 12l3.7-3.5l-1.5 10H5.3ZM5.5 21L18.5 21",
+["currency-robux"]="M12 3.5L19.5 8v8L12 20.5L4.5 16V8ZM9.5 15.5v-7h3a1.8 1.8 0 0 1 0 3.6h-3M12.5 12.1l2.2 3.4",
+["dash"]="M3.5 8L9.5 8M2.5 12L8 12M3.5 16L9.5 16M12.5 6.5L18 12l-5.5 5.5",
+["database"]="M4.5 6.5c0-1.7 3.4-3 7.5-3s7.5 1.3 7.5 3s-3.4 3-7.5 3s-7.5-1.3-7.5-3ZM4.5 6.5v5.5c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V6.5M4.5 12v5.5c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V12",
+["database-export"]="M5 6.5c0-1.4 3.1-2.5 7-2.5s7 1.1 7 2.5S15.9 9 12 9S5 7.9 5 6.5ZM5 6.5v5c0 1.4 3.1 2.5 7 2.5M19 6.5v3M5 11.5v5c0 1.4 3.1 2.5 7 2.5M15.5 17.5h5M18.5 15l2.5 2.5l-2.5 2.5",
+["dice"]="M7.8 4H16.2A3.8 3.8 0 0 1 20 7.8V16.2A3.8 3.8 0 0 1 16.2 20H7.8A3.8 3.8 0 0 1 4 16.2V7.8A3.8 3.8 0 0 1 7.8 4ZD8.8 8.8 1D15.2 8.8 1D12 12 1D8.8 15.2 1D15.2 15.2 1",
+["disc"]="M20.5 12A8.5 8.5 0 1 1 3.5 12A8.5 8.5 0 1 1 20.5 12ZM14.5 12A2.5 2.5 0 1 1 9.5 12A2.5 2.5 0 1 1 14.5 12ZM6.5 9.5A6 6 0 0 1 9.5 6.5",
+["dollar-sign"]="M12 3.5L12 20.5M16.5 8.2c-0.4-1.4-2-2.2-4.5-2.2c-2.7 0-4.3 1.1-4.3 2.8c0 4.2 9.2 1.8 9.2 6.2c0 1.8-1.7 3-4.6 3c-2.7 0-4.4-1-4.8-2.6",
+["double-jump"]="M6.5 12.5L12 7l5.5 5.5M6.5 18L12 12.5L17.5 18",
+["download"]="M12 4L12 15M7.5 10.5L12 15l4.5-4.5M4.5 15.5v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2",
+["dpad"]="M9.5 3.5h5v6h6v5h-6v6h-5v-6h-6v-5h6Z",
+["droplet"]="M12 3.8c3.3 3.7 6 6.7 6 10a6 6 0 0 1-12 0c0-3.3 2.7-6.3 6-10ZM9.2 14.5a2.8 2.8 0 0 0 2.3 2.3",
+["earth"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM8.5 4.5c0.5 1.5 1.8 2.2 2.5 3s0 2.2-1.2 2.5c-1.5 0.4-3 1.5-4 3M14.5 19.5c0-1.8 1-3 2.2-3.8c1.1-0.8 1.8-2 1.5-3.7",
+["emote"]="M18.5 12A7.5 7.5 0 1 1 3.5 12A7.5 7.5 0 1 1 18.5 12ZM7.8 13.5a3.5 3.5 0 0 0 6.4 0D8.8 10 0.9D13.2 10 0.9M19.5 3v4M17.5 5h4",
+["equalizer"]="M5.5 14L5.5 18M9.5 8L9.5 18M13.5 5L13.5 18M17.5 10L17.5 18",
+["erase"]="M9.5 19.5H20M4.6 14.6L13.7 5.5a2 2 0 0 1 2.8 0l3 3a2 2 0 0 1 0 2.8l-8 8H8.4a2 2 0 0 1-1.4-0.6l-2.4-2.4a2 2 0 0 1 0-2.8ZM9.6 9.6L15.4 15.4",
+["esp"]="M4 8.5V6a2 2 0 0 1 2-2h2.5M15.5 4H18a2 2 0 0 1 2 2v2.5M20 15.5V18a2 2 0 0 1-2 2h-2.5M8.5 20H6a2 2 0 0 1-2-2v-2.5M14.3 9.5A2.3 2.3 0 1 1 9.7 9.5A2.3 2.3 0 1 1 14.3 9.5ZM7.8 17c0.7-2 2.2-3 4.2-3s3.5 1 4.2 3",
+["execute"]="M7 7L3.5 12L7 17M17 7l3.5 5l-3.5 5M10.8 8.8v6.4l4.8-3.2Z",
+["expand"]="M4.5 9.5V6a1.5 1.5 0 0 1 1.5-1.5h3.5M14.5 4.5H18a1.5 1.5 0 0 1 1.5 1.5v3.5M19.5 14.5V18a1.5 1.5 0 0 1-1.5 1.5h-3.5M9.5 19.5H6A1.5 1.5 0 0 1 4.5 18v-3.5",
+["external-link"]="M13.5 4.5h6v6M19.5 4.5L11 13M17.5 14v3.5a2 2 0 0 1-2 2h-9a2 2 0 0 1-2-2v-9a2 2 0 0 1 2-2H10",
+["eye"]="M2.8 12S6.2 5.5 12 5.5S21.2 12 21.2 12S17.8 18.5 12 18.5S2.8 12 2.8 12ZM15 12A3 3 0 1 1 9 12A3 3 0 1 1 15 12Z",
+["eye-lock"]="M20.5 11.5S17.5 5.5 12 5.5S3.5 11.5 3.5 11.5S6.5 17.5 12 17.5M14.8 11.5A2.8 2.8 0 1 1 9.2 11.5A2.8 2.8 0 1 1 14.8 11.5ZM15.8 16H19.7A1.3 1.3 0 0 1 21 17.3V19.7A1.3 1.3 0 0 1 19.7 21H15.8A1.3 1.3 0 0 1 14.5 19.7V17.3A1.3 1.3 0 0 1 15.8 16ZM16 16v-1a1.8 1.8 0 0 1 3.5 0v1",
+["eye-off"]="M9.8 5.8A9 9 0 0 1 12 5.5C17.8 5.5 21.2 12 21.2 12a16 16 0 0 1-2.4 3.2M6.2 7.2A16 16 0 0 0 2.8 12S6.2 18.5 12 18.5a8.6 8.6 0 0 0 3.6-0.8M9.9 9.9a3 3 0 0 0 4.2 4.2M4 4L20 20",
+["fast-forward"]="M3.5 7v10a0.8 0.8 0 0 0 1.2 0.7l6.6-5a0.8 0.8 0 0 0 0-1.4l-6.6-5A0.8 0.8 0 0 0 3.5 7ZM12.5 7v10a0.8 0.8 0 0 0 1.2 0.7l6.6-5a0.8 0.8 0 0 0 0-1.4l-6.6-5a0.8 0.8 0 0 0-1.2 0.7Z",
+["file"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5",
+["file-archive"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M12 9.5L12 10.6M12 12.2L12 13.3M11.4 14.6H12.6A1 1 0 0 1 13.6 15.6V17A1 1 0 0 1 12.6 18H11.4A1 1 0 0 1 10.4 17V15.6A1 1 0 0 1 11.4 14.6Z",
+["file-audio"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M10.5 17V12.5l4-1V16M10.6 17A1.1 1.1 0 1 1 8.4 17A1.1 1.1 0 1 1 10.6 17ZM14.6 16A1.1 1.1 0 1 1 12.4 16A1.1 1.1 0 1 1 14.6 16Z",
+["file-check"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M9.5 14.5l1.8 1.8l3.4-3.6",
+["file-code"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M10.5 12.3L8.8 14l1.7 1.7M13.5 12.3l1.7 1.7l-1.7 1.7",
+["file-image"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M11.1 12.5A1.1 1.1 0 1 1 8.9 12.5A1.1 1.1 0 1 1 11.1 12.5ZM7.5 18.5l3.3-3.3l2 2l1.7-1.7l2.5 3",
+["file-json"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M10.5 12.2c-1 0-1.2 0.5-1.2 1.2v0.6c0 0.5-0.4 0.8-0.8 0.8c0.4 0 0.8 0.3 0.8 0.8v0.6c0 0.7 0.2 1.2 1.2 1.2M13.5 12.2c1 0 1.2 0.5 1.2 1.2v0.6c0 0.5 0.4 0.8 0.8 0.8c-0.4 0-0.8 0.3-0.8 0.8v0.6c0 0.7-0.2 1.2-1.2 1.2",
+["file-lock"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M10.2 14.2H13.8A1.2 1.2 0 0 1 15 15.4V17.3A1.2 1.2 0 0 1 13.8 18.5H10.2A1.2 1.2 0 0 1 9 17.3V15.4A1.2 1.2 0 0 1 10.2 14.2ZM10.2 14.2v-1.2a1.8 1.8 0 0 1 3.6 0v1.2",
+["file-minus"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M9.5 14.5L14.5 14.5",
+["file-plus"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M12 12L12 17M9.5 14.5L14.5 14.5",
+["file-search"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M13.7 14.5A2.2 2.2 0 1 1 9.3 14.5A2.2 2.2 0 1 1 13.7 14.5ZM13.2 16.2L15.2 18.2",
+["file-spreadsheet"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M9 12L15 12M9 15L15 15M9 18L15 18M11.5 12L11.5 18.5",
+["file-text"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M9 12.5L15 12.5M9 16L13 16",
+["file-video"]="M14 3.5H8A2.5 2.5 0 0 0 5.5 6v12A2.5 2.5 0 0 0 8 20.5h8a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3.5V7a1 1 0 0 0 1 1h3.5M9 12.2h4.2a0.8 0.8 0 0 1 0.8 0.8v3.2a0.8 0.8 0 0 1-0.8 0.8H9a0.8 0.8 0 0 1-0.8-0.8V13a0.8 0.8 0 0 1 0.8-0.8ZM14 14l2.2-1.3v3.6L14 15Z",
+["film"]="M6.6 4H17.4A2.6 2.6 0 0 1 20 6.6V17.4A2.6 2.6 0 0 1 17.4 20H6.6A2.6 2.6 0 0 1 4 17.4V6.6A2.6 2.6 0 0 1 6.6 4ZM8.5 4L8.5 20M15.5 4L15.5 20M4 9L8.5 9M4 15L8.5 15M15.5 9L20 9M15.5 15L20 15",
+["filter"]="M4 5.5h16l-6.2 7.4V18l-3.6 1.8v-6.9Z",
+["fingerprint"]="M6 9a6.5 6.5 0 0 1 12 0M5.5 13c0-1.5 0.2-2.5 0.5-3.5M8.5 18.5c0.8-1.5 1.2-3.2 1.2-5.5a2.3 2.3 0 0 1 4.6 0c0 2 0.3 4 1.5 6M12 14c0 2-0.4 4-1.5 5.8M18.5 13.5c0 2 0.3 3.5 1 5M18.2 10.5c0.2 1 0.3 2 0.3 3",
+["firewall"]="M5.5 5H18.5A2 2 0 0 1 20.5 7V17A2 2 0 0 1 18.5 19H5.5A2 2 0 0 1 3.5 17V7A2 2 0 0 1 5.5 5ZM3.5 9.7L20.5 9.7M3.5 14.3L20.5 14.3M9.5 5L9.5 9.7M15 9.7L15 14.3M9.5 14.3L9.5 19",
+["fish"]="M3.5 12c2.5-3.8 6-5.5 9-5.5s5 2 6 5.5c-1 3.5-3 5.5-6 5.5s-6.5-1.7-9-5.5ZM18.5 12l2.5-3v6ZD8.2 11 0.8",
+["flag"]="M5.5 20.5L5.5 4M5.5 5c3.5-2 6.5 2 10 0c1.4-0.8 2.5-0.8 3 0v8c-0.5-0.8-1.6-0.8-3 0c-3.5 2-6.5-2-10 0",
+["flame"]="M12 20.5a6 6 0 0 1-6-6c0-3.5 2.5-5 3.5-8.5c1.5 1 2.2 2.3 2.3 3.8c1.1-0.8 1.7-2 1.8-3.8C16.5 8 18 10.8 18 14.5a6 6 0 0 1-6 6ZM12 20.5a2.5 2.5 0 0 1-2.5-2.5c0-1.8 1.5-2.5 2.5-4c1 1.5 2.5 2.2 2.5 4A2.5 2.5 0 0 1 12 20.5Z",
+["flask"]="M9.5 3.5h5M10.5 3.5v6L5.8 17.2A2.5 2.5 0 0 0 8 21h8a2.5 2.5 0 0 0 2.2-3.8L13.5 9.5v-6M8 15L16 15",
+["flower"]="M14.4 12A2.4 2.4 0 1 1 9.6 12A2.4 2.4 0 1 1 14.4 12ZM12 9.6C10.5 8 10.5 5 12 3.5c1.5 1.5 1.5 4.5 0 6.1ZM14.4 12c1.6-1.5 4.6-1.5 6.1 0c-1.5 1.5-4.5 1.5-6.1 0ZM12 14.4c1.5 1.6 1.5 4.6 0 6.1c-1.5-1.5-1.5-4.5 0-6.1ZM9.6 12c-1.6 1.5-4.6 1.5-6.1 0c1.5-1.5 4.5-1.5 6.1 0Z",
+["fly"]="M3.5 16c1.8-4.5 5.5-7.3 10-7.5l5-2.5c0.3 3.5-1 6-3.5 7.5c-2.5 1.5-6.5 3.3-11.5 2.5ZM8.5 14.5c2-0.2 4-1.2 6-3",
+["folder"]="M4 7.5A2.5 2.5 0 0 1 6.5 5h3.2a2 2 0 0 1 1.5 0.7l1 1.3H17.5A2.5 2.5 0 0 1 20 9.5v7A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5Z",
+["folder-lock"]="M13 19H6.5A2.5 2.5 0 0 1 4 16.5v-9A2.5 2.5 0 0 1 6.5 5h3.2a2 2 0 0 1 1.5 0.7l1 1.3H17.5A2.5 2.5 0 0 1 20 9.5V11M15.3 14H19.2A1.3 1.3 0 0 1 20.5 15.3V18.2A1.3 1.3 0 0 1 19.2 19.5H15.3A1.3 1.3 0 0 1 14 18.2V15.3A1.3 1.3 0 0 1 15.3 14ZM15.5 14v-1.3a1.8 1.8 0 0 1 3.5 0V14",
+["folder-open"]="M4 17.5V7a2 2 0 0 1 2-2h3.3a2 2 0 0 1 1.5 0.7l1 1.3H17a2 2 0 0 1 2 2v1.5M4 17.5l1.8-6a1.5 1.5 0 0 1 1.4-1H20a1 1 0 0 1 1 1.3l-1.7 5.6a2 2 0 0 1-1.9 1.4H6a2 2 0 0 1-2-1.3Z",
+["folder-plus"]="M4 7.5A2.5 2.5 0 0 1 6.5 5h3.2a2 2 0 0 1 1.5 0.7l1 1.3H17.5A2.5 2.5 0 0 1 20 9.5v7A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5ZM12 10.5L12 15.5M9.5 13L14.5 13",
+["folder-tree"]="M4.9 4.5H8.1A1.4 1.4 0 0 1 9.5 5.9V7.6A1.4 1.4 0 0 1 8.1 9H4.9A1.4 1.4 0 0 1 3.5 7.6V5.9A1.4 1.4 0 0 1 4.9 4.5ZM14.9 10H19.1A1.4 1.4 0 0 1 20.5 11.4V13.1A1.4 1.4 0 0 1 19.1 14.5H14.9A1.4 1.4 0 0 1 13.5 13.1V11.4A1.4 1.4 0 0 1 14.9 10ZM14.9 16.5H19.1A1.4 1.4 0 0 1 20.5 17.9V19.1A1.4 1.4 0 0 1 19.1 20.5H14.9A1.4 1.4 0 0 1 13.5 19.1V17.9A1.4 1.4 0 0 1 14.9 16.5ZM6.5 9v9.5a1 1 0 0 0 1 1H13.5M6.5 12h7",
+["forklift"]="M3.5 16.5V10a1.5 1.5 0 0 1 1.5-1.5h4.5v8ZM9.5 12.5L13 12.5M13 4L13 17.5M13 17.5L19.5 17.5M7.7 19A1.7 1.7 0 1 1 4.3 19A1.7 1.7 0 1 1 7.7 19ZM12.7 19A1.7 1.7 0 1 1 9.3 19A1.7 1.7 0 1 1 12.7 19Z",
+["fps-boost"]="M5.6 4H18.4A2.6 2.6 0 0 1 21 6.6V13.9A2.6 2.6 0 0 1 18.4 16.5H5.6A2.6 2.6 0 0 1 3 13.9V6.6A2.6 2.6 0 0 1 5.6 4ZM12.8 6.8L9.8 11.5h3.6l-1 3.7l3.8-5h-3.6ZM12 16.5L12 20M8.5 20L15.5 20",
+["frown"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM8.2 16a4.6 4.6 0 0 1 7.6 0D9 9.8 0.9D15 9.8 0.9",
+["fuel"]="M5.5 20.5V5.5a2 2 0 0 1 2-2h5a2 2 0 0 1 2 2v15ZM8.8 6.5H11.2A0.8 0.8 0 0 1 12 7.3V9.2A0.8 0.8 0 0 1 11.2 10H8.8A0.8 0.8 0 0 1 8 9.2V7.3A0.8 0.8 0 0 1 8.8 6.5ZM4 20.5L16 20.5M14.5 9.5h2a1.5 1.5 0 0 1 1.5 1.5v5a1.5 1.5 0 0 0 3 0V9L18.5 6.5",
+["function"]="M14.5 4.5c-1.8-0.4-3 0.5-3.3 2L9.5 17c-0.3 1.6-1.5 2.4-3.5 2M7 10L14.5 10M13 14l5 5.5M18 14l-5 5.5",
+["gamepad"]="M7.5 6.5h9a4.5 4.5 0 0 1 4.4 3.7l0.9 5a2.7 2.7 0 0 1-4.7 2.2L14.5 15.5h-5L7 17.4a2.7 2.7 0 0 1-4.7-2.2l0.9-5A4.5 4.5 0 0 1 7.5 6.5ZM8 9.5L8 13.5M6 11.5L10 11.5D15.5 10.5 1D17.8 12.8 1",
+["gauge"]="M4.2 17.5a8.5 8.5 0 1 1 15.6 0M12 14L15.8 9.5D12 14.5 1.4M12 5.5L12 7M5.8 9L7 9.8M18.2 9L17 9.8",
+["gem"]="M7 4.5h10l3.5 4.5L12 20L3.5 9ZM3.5 9h17M9.5 4.5L8 9l4 11l4-11l-1.5-4.5",
+["gems"]="M9.5 6h6l2.5 3.2L12.5 18L7 9.2ZM7 9.2h11M10.5 6L9 9.2l3.5 8.8l3.5-8.8L14.5 6M5 4v3M3.5 5.5h3",
+["ghost"]="M5 20.5V11a7 7 0 0 1 14 0v9.5l-2.3-1.8l-2.4 1.8L12 18.7l-2.3 1.8l-2.4-1.8ZD9.5 11 1D14.5 11 1",
+["gift"]="M5.4 9H18.6A1.4 1.4 0 0 1 20 10.4V11.6A1.4 1.4 0 0 1 18.6 13H5.4A1.4 1.4 0 0 1 4 11.6V10.4A1.4 1.4 0 0 1 5.4 9ZM5.5 13v5.5a1.5 1.5 0 0 0 1.5 1.5h10a1.5 1.5 0 0 0 1.5-1.5V13M12 9L12 20M12 9c-3 0-5-1-5-2.8C7 4.8 8 4 9.2 4C11 4 12 6 12 9Zm0 0c3 0 5-1 5-2.8C17 4.8 16 4 14.8 4C13 4 12 6 12 9Z",
+["git-branch"]="M8.7 5.5A2.2 2.2 0 1 1 4.3 5.5A2.2 2.2 0 1 1 8.7 5.5ZM8.7 18.5A2.2 2.2 0 1 1 4.3 18.5A2.2 2.2 0 1 1 8.7 18.5ZM19.7 8.5A2.2 2.2 0 1 1 15.3 8.5A2.2 2.2 0 1 1 19.7 8.5ZM6.5 7.7L6.5 16.3M17.5 10.7c0 4-4 4.5-8.5 5.5",
+["git-commit"]="M15.6 12A3.6 3.6 0 1 1 8.4 12A3.6 3.6 0 1 1 15.6 12ZM3.5 12L8.4 12M15.6 12L20.5 12",
+["git-compare"]="M8.2 6A2.2 2.2 0 1 1 3.8 6A2.2 2.2 0 1 1 8.2 6ZM20.2 18A2.2 2.2 0 1 1 15.8 18A2.2 2.2 0 1 1 20.2 18ZM6 8.2v6.3a2.5 2.5 0 0 0 2.5 2.5H13M15 14.5L13 17l2 2.5M18 15.8V9.5A2.5 2.5 0 0 0 15.5 7H11M13 4.5L11 7l2 2.5",
+["git-merge"]="M8.7 5.5A2.2 2.2 0 1 1 4.3 5.5A2.2 2.2 0 1 1 8.7 5.5ZM8.7 18.5A2.2 2.2 0 1 1 4.3 18.5A2.2 2.2 0 1 1 8.7 18.5ZM19.7 13.5A2.2 2.2 0 1 1 15.3 13.5A2.2 2.2 0 1 1 19.7 13.5ZM6.5 7.7L6.5 16.3M6.5 7.7c0 4 3 5.8 8.8 5.8",
+["git-pull-request"]="M8.7 5.5A2.2 2.2 0 1 1 4.3 5.5A2.2 2.2 0 1 1 8.7 5.5ZM8.7 18.5A2.2 2.2 0 1 1 4.3 18.5A2.2 2.2 0 1 1 8.7 18.5ZM19.7 18.5A2.2 2.2 0 1 1 15.3 18.5A2.2 2.2 0 1 1 19.7 18.5ZM6.5 7.7L6.5 16.3M17.5 16.3V9.5a2 2 0 0 0-2-2H12.5M14.8 4.8L12.5 7.5l2.3 2.7",
+["globe"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM3.6 12h16.8M12 3.4c2.4 2.3 3.5 5.2 3.5 8.6s-1.1 6.3-3.5 8.6c-2.4-2.3-3.5-5.2-3.5-8.6S9.6 5.7 12 3.4Z",
+["grid"]="M5.8 4H8.7A1.8 1.8 0 0 1 10.5 5.8V8.7A1.8 1.8 0 0 1 8.7 10.5H5.8A1.8 1.8 0 0 1 4 8.7V5.8A1.8 1.8 0 0 1 5.8 4ZM15.3 4H18.2A1.8 1.8 0 0 1 20 5.8V8.7A1.8 1.8 0 0 1 18.2 10.5H15.3A1.8 1.8 0 0 1 13.5 8.7V5.8A1.8 1.8 0 0 1 15.3 4ZM5.8 13.5H8.7A1.8 1.8 0 0 1 10.5 15.3V18.2A1.8 1.8 0 0 1 8.7 20H5.8A1.8 1.8 0 0 1 4 18.2V15.3A1.8 1.8 0 0 1 5.8 13.5ZM15.3 13.5H18.2A1.8 1.8 0 0 1 20 15.3V18.2A1.8 1.8 0 0 1 18.2 20H15.3A1.8 1.8 0 0 1 13.5 18.2V15.3A1.8 1.8 0 0 1 15.3 13.5Z",
+["grip"]="D9 6 1.3D15 6 1.3D9 12 1.3D15 12 1.3D9 18 1.3D15 18 1.3",
+["group"]="M15 8A3 3 0 1 1 9 8A3 3 0 1 1 15 8ZM7.8 10.5A2.3 2.3 0 1 1 3.2 10.5A2.3 2.3 0 1 1 7.8 10.5ZM20.8 10.5A2.3 2.3 0 1 1 16.2 10.5A2.3 2.3 0 1 1 20.8 10.5ZM7.2 19.5c0.5-3 2.3-4.5 4.8-4.5s4.3 1.5 4.8 4.5M3 17c0.3-1.8 1.3-2.8 2.8-3M21 17c-0.3-1.8-1.3-2.8-2.8-3",
+["halo"]="M8 4.5a4 1.6 0 1 0 8 0a4 1.6 0 1 0-8 0ZM15.2 12A3.2 3.2 0 1 1 8.8 12A3.2 3.2 0 1 1 15.2 12ZM6 20c0.8-3 3-4.5 6-4.5s5.2 1.5 6 4.5",
+["hammer"]="M13.9 3.8L20.2 10.1C20.8 10.6 20.8 11.5 20.2 12L19 13.2C18.5 13.8 17.6 13.8 17.1 13.2L10.8 6.9C10.2 6.4 10.2 5.5 10.8 5L12 3.8C12.5 3.2 13.4 3.2 13.9 3.8ZM14 10L5.2 18.8",
+["hand"]="M8 12V6.5a1.5 1.5 0 0 1 3 0V11M11 10.5V4.5a1.5 1.5 0 0 1 3 0v6M14 10.5V6a1.5 1.5 0 0 1 3 0v8.5a6 6 0 0 1-6 6h-0.5a5.5 5.5 0 0 1-4.6-2.5L3.7 13.6a1.5 1.5 0 0 1 2.5-1.6L8 14.2",
+["hard-drive"]="M4 14.5L6.6 6.8A2 2 0 0 1 8.5 5.5h7a2 2 0 0 1 1.9 1.3L20 14.5V17a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2ZM4 14.5L20 14.5D8 16.8 0.9M11 16.8L12 16.8",
+["hash"]="M9.5 4L8 20M16 4L14.5 20M4.5 9L20 9M4 15L19.5 15",
+["headphones"]="M4.5 15v-3a7.5 7.5 0 0 1 15 0v3M4.5 15.2a1.7 1.7 0 0 1 1.7-1.7h0.6a1.2 1.2 0 0 1 1.2 1.2v3.1a1.2 1.2 0 0 1-1.2 1.2H6.2a1.7 1.7 0 0 1-1.7-1.7ZM19.5 15.2a1.7 1.7 0 0 0-1.7-1.7h-0.6A1.2 1.2 0 0 0 16 14.7v3.1a1.2 1.2 0 0 0 1.2 1.2h0.6a1.7 1.7 0 0 0 1.7-1.7Z",
+["health-bar"]="M6.5 8.5H17.5A3.5 3.5 0 0 1 21 12V12A3.5 3.5 0 0 1 17.5 15.5H6.5A3.5 3.5 0 0 1 3 12V12A3.5 3.5 0 0 1 6.5 8.5ZM6.5 12L13.5 12M17 10.2v3.6M15.2 12h3.6",
+["heart"]="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20Z",
+["heart-health"]="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20ZM12 10.8L12 15.2M9.8 13L14.2 13",
+["heart-pulse"]="M12 20s-7.5-4.6-7.5-10.2A4.3 4.3 0 0 1 12 7.2a4.3 4.3 0 0 1 7.5 2.6C19.5 15.4 12 20 12 20ZM4.8 12.5h3.5l1.5-2.5l2.2 4.5l1.5-2H19",
+["helicopter"]="M4 9.5a3 3 0 0 1 3-3h6.5a4.5 4.5 0 0 1 4.5 4.5V14a1.5 1.5 0 0 1-1.5 1.5H7a3 3 0 0 1-3-3ZM4.5 4L15 4M9.5 4L9.5 6.5M18 11h3.5M3.5 18.5h14M8 15.5v3M14 15.5v3",
+["helmet"]="M4.5 20V12a7.5 7.5 0 0 1 15 0v8l-3-1v-4.5h-9V19ZM12 4.5L12 9.5M8 11.5L16 11.5",
+["help-circle"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM9.6 9.6a2.5 2.5 0 0 1 4.8 0.8c0 1.7-2.4 2.1-2.4 3.6D12 16.5 0.6",
+["history"]="M4 12a8 8 0 1 0 2.6-5.9L4 8.5M4 4v4.5h4.5M12 7.8V12l2.8 1.8",
+["home"]="M4 11.2L12 4l8 7.2V19a1 1 0 0 1-1 1h-4.2v-5.4a1 1 0 0 0-1-1h-3.6a1 1 0 0 0-1 1V20H5a1 1 0 0 1-1-1Z",
+["hourglass"]="M6.5 3.5h11M6.5 20.5h11M8 3.5v3.2a4 4 0 0 0 1.7 3.3L12 12l-2.3 2a4 4 0 0 0-1.7 3.3v3.2M16 3.5v3.2a4 4 0 0 1-1.7 3.3L12 12l2.3 2a4 4 0 0 1 1.7 3.3v3.2",
+["hub"]="M12 3.5l7.5 4.3v8.4L12 20.5l-7.5-4.3V7.8ZM14.3 12A2.3 2.3 0 1 1 9.7 12A2.3 2.3 0 1 1 14.3 12ZM12 9.7L12 3.5M14 13.2L19.5 16.2M10 13.2L4.5 16.2",
+["id-card"]="M6.1 5.5H17.9A2.6 2.6 0 0 1 20.5 8.1V15.9A2.6 2.6 0 0 1 17.9 18.5H6.1A2.6 2.6 0 0 1 3.5 15.9V8.1A2.6 2.6 0 0 1 6.1 5.5ZM11 11.2A2 2 0 1 1 7 11.2A2 2 0 1 1 11 11.2ZM5.8 16.2c0.6-1.5 1.7-2.2 3.2-2.2s2.6 0.7 3.2 2.2M14.5 10L17.5 10M14.5 13.5L17.5 13.5",
+["image"]="M6.3 4.5H17.7A2.8 2.8 0 0 1 20.5 7.3V16.7A2.8 2.8 0 0 1 17.7 19.5H6.3A2.8 2.8 0 0 1 3.5 16.7V7.3A2.8 2.8 0 0 1 6.3 4.5ZM10.7 10A1.7 1.7 0 1 1 7.3 10A1.7 1.7 0 1 1 10.7 10ZM4 17.5l4.8-4.8a1.5 1.5 0 0 1 2.1 0l2.6 2.6l2-2a1.5 1.5 0 0 1 2.1 0l2.4 2.4",
+["image-play"]="M6.3 4.5H17.7A2.8 2.8 0 0 1 20.5 7.3V16.7A2.8 2.8 0 0 1 17.7 19.5H6.3A2.8 2.8 0 0 1 3.5 16.7V7.3A2.8 2.8 0 0 1 6.3 4.5ZM10 9.5v5a0.6 0.6 0 0 0 0.9 0.5l4.2-2.5a0.6 0.6 0 0 0 0-1l-4.2-2.5a0.6 0.6 0 0 0-0.9 0.5Z",
+["images"]="M9.9 7.5H18.1A2.4 2.4 0 0 1 20.5 9.9V16.1A2.4 2.4 0 0 1 18.1 18.5H9.9A2.4 2.4 0 0 1 7.5 16.1V9.9A2.4 2.4 0 0 1 9.9 7.5ZM4.5 15.5v-8.5a2.5 2.5 0 0 1 2.5-2.5h9M8 17.5l3-3l2.2 2.2l1.8-1.8l2.5 2.6M13.1 11.2A1.1 1.1 0 1 1 10.9 11.2A1.1 1.1 0 1 1 13.1 11.2Z",
+["inbox"]="M3.8 13.5L6.5 6a2 2 0 0 1 1.9-1.3h7.2a2 2 0 0 1 1.9 1.3l2.7 7.5V17a2.5 2.5 0 0 1-2.5 2.5H6.3A2.5 2.5 0 0 1 3.8 17ZM3.8 13.5h4.3a1 1 0 0 1 1 0.7a3 3 0 0 0 5.8 0a1 1 0 0 1 1-0.7h4.3",
+["info"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM12 11L12 16D12 8 0.6",
+["inject"]="M14.5 5.5L18.5 9.5M16.5 3.5l4 4M12.5 7.5l4 4l-6.5 6.5H8l-2-2v-2ZM5.5 18.5L3.5 20.5M9.5 12.5L11.5 14.5",
+["inventory"]="M5.1 3.8H7.3A1.3 1.3 0 0 1 8.6 5.1V7.3A1.3 1.3 0 0 1 7.3 8.6H5.1A1.3 1.3 0 0 1 3.8 7.3V5.1A1.3 1.3 0 0 1 5.1 3.8ZM10.9 3.8H13.1A1.3 1.3 0 0 1 14.4 5.1V7.3A1.3 1.3 0 0 1 13.1 8.6H10.9A1.3 1.3 0 0 1 9.6 7.3V5.1A1.3 1.3 0 0 1 10.9 3.8ZM16.7 3.8H18.9A1.3 1.3 0 0 1 20.2 5.1V7.3A1.3 1.3 0 0 1 18.9 8.6H16.7A1.3 1.3 0 0 1 15.4 7.3V5.1A1.3 1.3 0 0 1 16.7 3.8ZM5.1 9.6H7.3A1.3 1.3 0 0 1 8.6 10.9V13.1A1.3 1.3 0 0 1 7.3 14.4H5.1A1.3 1.3 0 0 1 3.8 13.1V10.9A1.3 1.3 0 0 1 5.1 9.6ZM10.9 9.6H13.1A1.3 1.3 0 0 1 14.4 10.9V13.1A1.3 1.3 0 0 1 13.1 14.4H10.9A1.3 1.3 0 0 1 9.6 13.1V10.9A1.3 1.3 0 0 1 10.9 9.6ZM16.7 9.6H18.9A1.3 1.3 0 0 1 20.2 10.9V13.1A1.3 1.3 0 0 1 18.9 14.4H16.7A1.3 1.3 0 0 1 15.4 13.1V10.9A1.3 1.3 0 0 1 16.7 9.6ZM5.1 15.4H7.3A1.3 1.3 0 0 1 8.6 16.7V18.9A1.3 1.3 0 0 1 7.3 20.2H5.1A1.3 1.3 0 0 1 3.8 18.9V16.7A1.3 1.3 0 0 1 5.1 15.4ZM10.9 15.4H13.1A1.3 1.3 0 0 1 14.4 16.7V18.9A1.3 1.3 0 0 1 13.1 20.2H10.9A1.3 1.3 0 0 1 9.6 18.9V16.7A1.3 1.3 0 0 1 10.9 15.4ZM16.7 15.4H18.9A1.3 1.3 0 0 1 20.2 16.7V18.9A1.3 1.3 0 0 1 18.9 20.2H16.7A1.3 1.3 0 0 1 15.4 18.9V16.7A1.3 1.3 0 0 1 16.7 15.4Z",
+["joystick"]="M14.8 6.5A2.8 2.8 0 1 1 9.2 6.5A2.8 2.8 0 1 1 14.8 6.5ZM12 9.3L12 14M4.5 20v-1.5a3 3 0 0 1 3-3h9a3 3 0 0 1 3 3V20ZD8.5 18 0.8D15.5 18 0.8",
+["key"]="M12.2 15.5A4.2 4.2 0 1 1 3.8 15.5A4.2 4.2 0 1 1 12.2 15.5ZM11 12.5L20 3.5M16.5 7l2.5 2.5M14 9.5l2 2",
+["key-code"]="M6.3 5.5H17.7A2.8 2.8 0 0 1 20.5 8.3V15.7A2.8 2.8 0 0 1 17.7 18.5H6.3A2.8 2.8 0 0 1 3.5 15.7V8.3A2.8 2.8 0 0 1 6.3 5.5ZM8.5 10.5L6.5 12l2 1.5M15.5 10.5l2 1.5l-2 1.5M12.8 9.5L11.2 14.5",
+["keyboard"]="M5.2 6.5H18.8A2.4 2.4 0 0 1 21.2 8.9V15.1A2.4 2.4 0 0 1 18.8 17.5H5.2A2.4 2.4 0 0 1 2.8 15.1V8.9A2.4 2.4 0 0 1 5.2 6.5ZM6.5 10.2L6.5 10.2M10 10.2L10.2 10.2M13.8 10.2L14 10.2M17.5 10.2L17.5 10.2M8 14L16 14",
+["laptop"]="M6.5 17V7.5a2 2 0 0 1 2-2h7a2 2 0 0 1 2 2V17M3.5 17h17v0.8a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7Z",
+["layers"]="M12 4L20.5 8.8L12 13.6L3.5 8.8ZM3.5 12.3L12 17.1l8.5-4.8M3.5 15.8L12 20.6l8.5-4.8",
+["leaderboard"]="M4.8 12H7.7A1.3 1.3 0 0 1 9 13.3V19.2A1.3 1.3 0 0 1 7.7 20.5H4.8A1.3 1.3 0 0 1 3.5 19.2V13.3A1.3 1.3 0 0 1 4.8 12ZM10.6 8H13.4A1.3 1.3 0 0 1 14.8 9.3V19.2A1.3 1.3 0 0 1 13.4 20.5H10.6A1.3 1.3 0 0 1 9.2 19.2V9.3A1.3 1.3 0 0 1 10.6 8ZM16.3 14.5H19.2A1.3 1.3 0 0 1 20.5 15.8V19.2A1.3 1.3 0 0 1 19.2 20.5H16.3A1.3 1.3 0 0 1 15 19.2V15.8A1.3 1.3 0 0 1 16.3 14.5ZM12 2.8l0.9 1.6l1.6 0.2l-1.2 1.1l0.3 1.7l-1.6-0.9l-1.6 0.9l0.3-1.7l-1.2-1.1l1.6-0.2Z",
+["leaf"]="M5 19C3.5 11 8 4.5 19.5 4.5C19.8 14 14.5 19.5 8 18.8M5 19c2.5-5 5.5-8 10-10.5",
+["level-up"]="M12 3.5L18.5 11H15v5H9v-5H5.5ZM8 20L16 20",
+["line-chart"]="M4 4v14.5a1.5 1.5 0 0 0 1.5 1.5H20M7.5 15l3.5-4.5l3 2.5l5-6",
+["link"]="M10 14a4.2 4.2 0 0 0 5.9 0.4l3-3a4.2 4.2 0 0 0-5.9-5.9l-1.1 1.1M14 10a4.2 4.2 0 0 0-5.9-0.4l-3 3a4.2 4.2 0 0 0 5.9 5.9l1.1-1.1",
+["link-2"]="M9.5 7H8a5 5 0 0 0 0 10h1.5M14.5 7H16a5 5 0 0 1 0 10h-1.5M8.5 12L15.5 12",
+["list"]="D5 7 1.1D5 12 1.1D5 17 1.1M9.5 7L19.5 7M9.5 12L19.5 12M9.5 17L19.5 17",
+["loader"]="M12 3.5L12 6.5M12 17.5L12 20.5M3.5 12L6.5 12M17.5 12L20.5 12M6 6L8.1 8.1M15.9 15.9L18 18M6 18L8.1 15.9M15.9 8.1L18 6",
+["locate"]="M17.8 12A5.8 5.8 0 1 1 6.2 12A5.8 5.8 0 1 1 17.8 12ZM12 3.5L12 6.5M12 17.5L12 20.5M3.5 12L6.5 12M17.5 12L20.5 12D12 12 1.3",
+["lock"]="M7.8 10.5H16.2A2.8 2.8 0 0 1 19 13.3V17.7A2.8 2.8 0 0 1 16.2 20.5H7.8A2.8 2.8 0 0 1 5 17.7V13.3A2.8 2.8 0 0 1 7.8 10.5ZM8 10.5V8a4 4 0 0 1 8 0v2.5D12 15.5 1.2",
+["log-in"]="M14.5 4.5h3a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2h-3M10 7.5l4.5 4.5L10 16.5M14.5 12L4.5 12",
+["log-out"]="M9.5 4.5h-3a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h3M14 7.5l4.5 4.5l-4.5 4.5M18.5 12L8.5 12",
+["lua-moon"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM15.8 13.8A4.6 4.6 0 0 1 10.2 8.2a4.6 4.6 0 1 0 5.6 5.6ZM18.8 6.7A1.5 1.5 0 1 1 15.8 6.7A1.5 1.5 0 1 1 18.8 6.7Z",
+["mail"]="M6.1 5.5H17.9A2.6 2.6 0 0 1 20.5 8.1V15.9A2.6 2.6 0 0 1 17.9 18.5H6.1A2.6 2.6 0 0 1 3.5 15.9V8.1A2.6 2.6 0 0 1 6.1 5.5ZM4.5 8.2L12 13.2l7.5-5",
+["map"]="M3.5 6.5L9 4.5l6 2.2l5.5-2v13l-5.5 2l-6-2.2l-5.5 2ZM9 4.5L9 17.3M15 6.7L15 19.5",
+["map-pin"]="M12 20.5s-6.5-5.5-6.5-10.8a6.5 6.5 0 0 1 13 0c0 5.3-6.5 10.8-6.5 10.8ZM14.4 9.7A2.4 2.4 0 1 1 9.6 9.7A2.4 2.4 0 1 1 14.4 9.7Z",
+["map-route"]="M8 18A2 2 0 1 1 4 18A2 2 0 1 1 8 18ZM8 18h8a3 3 0 0 0 0-6H8a3 3 0 0 1 0-6h4M18 3a2.8 2.8 0 0 0-2.8 2.8c0 2 2.8 4.5 2.8 4.5s2.8-2.5 2.8-4.5A2.8 2.8 0 0 0 18 3Z",
+["maximize"]="M7.1 4.5H16.9A2.6 2.6 0 0 1 19.5 7.1V16.9A2.6 2.6 0 0 1 16.9 19.5H7.1A2.6 2.6 0 0 1 4.5 16.9V7.1A2.6 2.6 0 0 1 7.1 4.5Z",
+["medal"]="M17.5 14.5A5.5 5.5 0 1 1 6.5 14.5A5.5 5.5 0 1 1 17.5 14.5ZM8.5 10L6.5 3.5h4L12 7M15.5 10l2-6.5h-4L12 7M12 12l1 2h2l-1.6 1.3l0.6 2L12 16l-2 1.3l0.6-2L9 14h2Z",
+["megaphone"]="M4 10.5v3a1 1 0 0 0 1 1h2.5L16 19V5L7.5 9.5H5a1 1 0 0 0-1 1ZM7.5 14.5L8.7 19.5M19 9.5a3.5 3.5 0 0 1 0 5",
+["meh"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM8.8 15L15.2 15D9 9.8 0.9D15 9.8 0.9",
+["memory-card"]="M7 3.5h7.5L19 8v10.5a1.5 1.5 0 0 1-1.5 1.5h-10.5A1.5 1.5 0 0 1 5.5 18.5V5A1.5 1.5 0 0 1 7 3.5ZM9 7L9 10M12 7L12 10M15 8.5L15 10",
+["menu"]="M4.5 7L19.5 7M4.5 12L19.5 12M4.5 17L13.5 17",
+["message-circle"]="M4.5 19.5l1.1-3.7A8 8 0 1 1 9 18.9Z",
+["message-square"]="M5.5 4.5h13a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2H10l-4.2 3.5a0.5 0.5 0 0 1-0.8-0.4V17a2 2 0 0 1-0.5-0.5V6.5a2 2 0 0 1 2-2Z",
+["mic"]="M12 3.5H12A3 3 0 0 1 15 6.5V12A3 3 0 0 1 12 15H12A3 3 0 0 1 9 12V6.5A3 3 0 0 1 12 3.5ZM5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v2.5M9 20.5h6",
+["mic-off"]="M9 6.5V6.5a3 3 0 0 1 6 0V11M9 9.5V12a3 3 0 0 0 4.8 2.4M5.5 11.5a6.5 6.5 0 0 0 9.8 5.6M18.5 11.5c0 0.8-0.1 1.5-0.4 2.2M12 18v2.5M9 20.5h6M4 4L20 20",
+["minimize"]="M5 18L19 18",
+["minus"]="M5 12L19 12",
+["monitor"]="M5.9 4.5H18.1A2.4 2.4 0 0 1 20.5 6.9V13.6A2.4 2.4 0 0 1 18.1 16H5.9A2.4 2.4 0 0 1 3.5 13.6V6.9A2.4 2.4 0 0 1 5.9 4.5ZM12 16L12 19.5M8 19.5L16 19.5",
+["moon"]="M19.8 14.2A8 8 0 0 1 9.8 4.2a8 8 0 1 0 10 10Z",
+["moon-star"]="M17.5 14.5A7.5 7.5 0 0 1 9.5 5a7.5 7.5 0 1 0 8 9.5ZM17 4v3.5M15.2 5.8h3.6",
+["more-horizontal"]="D5.5 12 1.5D12 12 1.5D18.5 12 1.5",
+["more-vertical"]="D12 5.5 1.5D12 12 1.5D12 18.5 1.5",
+["motorcycle"]="M9 16.5A3 3 0 1 1 3 16.5A3 3 0 1 1 9 16.5ZM21 16.5A3 3 0 1 1 15 16.5A3 3 0 1 1 21 16.5ZM6 16.5l3-6h5l4 6M14 10.5l-1.5-4h-3M10 14h5M12.5 6.5L16 6.5",
+["mountain"]="M3 19.5L9.5 7.5a1 1 0 0 1 1.8 0L14 12.5l1.5-2.3a1 1 0 0 1 1.7 0L21 19.5ZM8 11.5l1.5 1.3l1.5-1.3",
+["mouse"]="M12 3.5c-3.6 0-6 2.3-6 5.8v5.4c0 3.5 2.4 5.8 6 5.8s6-2.3 6-5.8V9.3c0-3.5-2.4-5.8-6-5.8ZM12 3.8L12 9.5M6.2 9.5L17.8 9.5",
+["mouse-pointer"]="M6 4.5v14.2l3.6-3.3l2.6 5.1l2.3-1.1l-2.5-5l4.8-0.3Z",
+["move"]="M12 3.5L12 20.5M3.5 12L20.5 12M9 6.5L12 3.5l3 3M9 17.5l3 3l3-3M6.5 9L3.5 12l3 3M17.5 9l3 3l-3 3",
+["mushroom"]="M4 12.5a8 8 0 0 1 16 0ZM9.5 12.5v4.5a2.5 2.5 0 0 0 5 0v-4.5D9 9.5 0.9D14.5 8.5 0.9",
+["music"]="M9 17.5V6.5l10-2v11M9 17.5A2.5 2.5 0 1 1 4 17.5A2.5 2.5 0 1 1 9 17.5ZM19 15.5A2.5 2.5 0 1 1 14 15.5A2.5 2.5 0 1 1 19 15.5Z",
+["navigation"]="M4.6 11L19.4 4.6L13 19.4l-2.2-6.2Z",
+["network"]="M10.4 3.5H13.6A1.4 1.4 0 0 1 15 4.9V7.1A1.4 1.4 0 0 1 13.6 8.5H10.4A1.4 1.4 0 0 1 9 7.1V4.9A1.4 1.4 0 0 1 10.4 3.5ZM4.4 15.5H7.6A1.4 1.4 0 0 1 9 16.9V19.1A1.4 1.4 0 0 1 7.6 20.5H4.4A1.4 1.4 0 0 1 3 19.1V16.9A1.4 1.4 0 0 1 4.4 15.5ZM16.4 15.5H19.6A1.4 1.4 0 0 1 21 16.9V19.1A1.4 1.4 0 0 1 19.6 20.5H16.4A1.4 1.4 0 0 1 15 19.1V16.9A1.4 1.4 0 0 1 16.4 15.5ZM12 8.5v3.5M6 15.5V12h12v3.5",
+["noclip"]="M10.7 3.5H13.3A1.2 1.2 0 0 1 14.5 4.7V19.3A1.2 1.2 0 0 1 13.3 20.5H10.7A1.2 1.2 0 0 1 9.5 19.3V4.7A1.2 1.2 0 0 1 10.7 3.5ZM3.5 12L20.5 12M17 8.5L20.5 12L17 15.5",
+["notebook"]="M7.5 3.5h9a2 2 0 0 1 2 2v13a2 2 0 0 1-2 2h-9a1.5 1.5 0 0 1-1.5-1.5v-14A1.5 1.5 0 0 1 7.5 3.5ZM9.5 3.5L9.5 20.5M12.5 8L15.5 8M12.5 11.5L15.5 11.5",
+["npc"]="M11.5 9.5A3 3 0 1 1 5.5 9.5A3 3 0 1 1 11.5 9.5ZM3 20c0.7-3.2 2.7-4.8 5.5-4.8S13.3 16.8 14 20M14.5 3.5h5a1.5 1.5 0 0 1 1.5 1.5v3a1.5 1.5 0 0 1-1.5 1.5H18l-2 1.8V9.5h-1.5A1.5 1.5 0 0 1 13 8V5a1.5 1.5 0 0 1 1.5-1.5ZD15.5 6.5 0.6D17.5 6.5 0.6",
+["offline"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM7.5 12L16.5 12",
+["online"]="M15.6 12A3.6 3.6 0 1 1 8.4 12A3.6 3.6 0 1 1 15.6 12ZM6.6 6.6a7.7 7.7 0 0 0 0 10.8M17.4 6.6a7.7 7.7 0 0 1 0 10.8",
+["package"]="M12 3.5L19.8 7.8v8.4L12 20.5L4.2 16.2V7.8ZM8 5.7l7.8 4.3V13M4.5 8L12 12.2L19.5 8M12 12.2L12 20.3",
+["paintbrush"]="M19.6 4.4c-4 2.6-7 5.8-8.7 9.2l1.4 1.4c3.4-1.7 6.6-4.7 9.2-8.7ZM10.8 13.7c-2.4-0.4-4.4 1.3-4.4 3.4c0 1.2-0.8 2-2 2.4c1.7 0.9 4.4 0.9 5.9-0.5c1.1-1 1.5-2.5 0.5-5.3Z",
+["palette"]="M12 3.5a8.5 8.5 0 1 0 0 17c1.3 0 2-0.8 2-1.8c0-0.5-0.2-0.9-0.5-1.3c-0.3-0.4-0.5-0.8-0.5-1.3c0-1 0.8-1.8 1.8-1.8H17.5A3 3 0 0 0 20.5 11.8C20.5 7.2 16.7 3.5 12 3.5ZD7.8 11.5 1.1D10 7.6 1.1D14.5 7.6 1.1",
+["panel-bottom"]="M6.1 4.5H17.9A2.6 2.6 0 0 1 20.5 7.1V16.9A2.6 2.6 0 0 1 17.9 19.5H6.1A2.6 2.6 0 0 1 3.5 16.9V7.1A2.6 2.6 0 0 1 6.1 4.5ZM3.5 14L20.5 14",
+["paperclip"]="M19.5 11.2L12 18.7a5 5 0 0 1-7-7l7.8-7.8a3.3 3.3 0 0 1 4.7 4.7L9.7 16.4a1.7 1.7 0 0 1-2.3-2.3L14.5 7",
+["parentheses"]="M9.5 4.5c-2.5 2-3.5 4.5-3.5 7.5s1 5.5 3.5 7.5M14.5 4.5c2.5 2 3.5 4.5 3.5 7.5s-1 5.5-3.5 7.5",
+["parking"]="M7.5 4H16.5A3.5 3.5 0 0 1 20 7.5V16.5A3.5 3.5 0 0 1 16.5 20H7.5A3.5 3.5 0 0 1 4 16.5V7.5A3.5 3.5 0 0 1 7.5 4ZM9.8 16.5v-9h3.5a2.8 2.8 0 0 1 0 5.6H9.8",
+["password"]="M5.6 7.5H18.4A2.6 2.6 0 0 1 21 10.1V13.9A2.6 2.6 0 0 1 18.4 16.5H5.6A2.6 2.6 0 0 1 3 13.9V10.1A2.6 2.6 0 0 1 5.6 7.5ZD7.5 12 1D12 12 1D16.5 12 1",
+["pause"]="M8 4.5H9A1.5 1.5 0 0 1 10.5 6V18A1.5 1.5 0 0 1 9 19.5H8A1.5 1.5 0 0 1 6.5 18V6A1.5 1.5 0 0 1 8 4.5ZM15 4.5H16A1.5 1.5 0 0 1 17.5 6V18A1.5 1.5 0 0 1 16 19.5H15A1.5 1.5 0 0 1 13.5 18V6A1.5 1.5 0 0 1 15 4.5Z",
+["pause-circle"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM10 9.3L10 14.7M14 9.3L14 14.7",
+["paw"]="M12 12.5c-2.8 0-5 2.4-5 4.3c0 1.6 1.3 2.2 2.4 2.2c1 0 1.7-0.5 2.6-0.5s1.6 0.5 2.6 0.5c1.1 0 2.4-0.6 2.4-2.2c0-1.9-2.2-4.3-5-4.3ZM7.7 10A1.7 1.7 0 1 1 4.3 10A1.7 1.7 0 1 1 7.7 10ZM11.2 6.5A1.7 1.7 0 1 1 7.8 6.5A1.7 1.7 0 1 1 11.2 6.5ZM16.2 6.5A1.7 1.7 0 1 1 12.8 6.5A1.7 1.7 0 1 1 16.2 6.5ZM19.7 10A1.7 1.7 0 1 1 16.3 10A1.7 1.7 0 1 1 19.7 10Z",
+["pencil"]="M5 19l0.9-3.8L16.3 3.8a1.9 1.9 0 0 1 2.7 0l1.2 1.2a1.9 1.9 0 0 1 0 2.7L8.8 19.1ZM14.2 6L18 9.8",
+["percent"]="M18.5 5.5L5.5 18.5M9.6 7.2A2.4 2.4 0 1 1 4.8 7.2A2.4 2.4 0 1 1 9.6 7.2ZM19.2 16.8A2.4 2.4 0 1 1 14.4 16.8A2.4 2.4 0 1 1 19.2 16.8Z",
+["pie-chart"]="M20.2 14.5A8.6 8.6 0 1 1 9.5 3.8M13.5 3.6a8.6 8.6 0 0 1 6.9 6.9h-6.9Z",
+["piggy-bank"]="M6.5 8.8A7 7 0 0 1 12 7h2.5a5.5 5.5 0 0 1 5 3.5h1v3.2l-1.6 0.8A4.7 4.7 0 0 1 16.5 17v2.3h-2.3V18H10v1.3H7.7V16.5a6 6 0 0 1-2.2-3.6H3.5v-2.3l2.3-0.4ZD14.8 11.8 0.8M9.5 7a2 2 0 0 1 2-2",
+["pin"]="M14.5 4L20 9.5l-2 0.8l-3.2 3.2l0.4 3.5l-1.3 1.3l-3.5-3.5l-4.6 4.6l-0.7-0.7l4.6-4.6L6.2 10.6l1.3-1.3l3.5 0.4L14.2 6.5Z",
+["plane"]="M12 3.5c1.1 0 1.8 0.9 1.8 2V9.5l7 4.2v2l-7-2.2V18l2 1.5v1.3L12 19.8l-3.8 1v-1.3l2-1.5v-4.5l-7 2.2v-2l7-4.2V5.5c0-1.1 0.7-2 1.8-2Z",
+["play"]="M8 5.5v13a1 1 0 0 0 1.5 0.9l10-6.5a1 1 0 0 0 0-1.7l-10-6.5A1 1 0 0 0 8 5.5Z",
+["player"]="M10.6 3.5H13.4A1.6 1.6 0 0 1 15 5.1V7.9A1.6 1.6 0 0 1 13.4 9.5H10.6A1.6 1.6 0 0 1 9 7.9V5.1A1.6 1.6 0 0 1 10.6 3.5ZM6.5 13a1.5 1.5 0 0 1 1.5-1.5h8a1.5 1.5 0 0 1 1.5 1.5v7.5h-4v-4h-3v4h-4Z",
+["plug"]="M9 3.5L9 8M15 3.5L15 8M6.5 8h11v3.5a5.5 5.5 0 0 1-11 0ZM12 17L12 20.5",
+["plugin"]="M8.5 3.5v4M15.5 3.5v4M6 7.5h12v3.5a6 6 0 0 1-6 6a6 6 0 0 1-6-6ZM12 17L12 20.5",
+["plus"]="M12 5L12 19M5 12L19 12",
+["pointer-click"]="M9.5 9.5l9 3.2l-3.8 1.8l-1.8 3.8ZM9 4L9 5.8M4 9L5.8 9M5.5 5.5L6.8 6.8M12.5 5.5L11.2 6.8",
+["portal"]="M12 3.5a6 8.5 0 1 0 0 17a6 8.5 0 1 0 0-17ZM12 7a2.8 5 0 1 0 0 10a2.8 5 0 1 0 0-10Z",
+["potion"]="M10 3.5h4M10.5 3.5V8L5.8 16.2A2.6 2.6 0 0 0 8 20h8a2.6 2.6 0 0 0 2.2-3.8L13.5 8V3.5M7.8 14.5c1.5-0.8 2.8-0.8 4.2 0s2.7 0.8 4.2 0D11 17.5 0.6",
+["power"]="M7 6.6a8 8 0 1 0 10 0M12 3.5L12 11.5",
+["power-plug-off"]="M9 3.5V8M15 3.5V8M7 8h10v3.2a5 5 0 0 1-1.5 3.6M8.3 14.8A5 5 0 0 1 7 11.2V8M12 16.5L12 20.5M4 4L20 20",
+["printer"]="M7 8.5V4.5h10v4M7 16H5.5a2 2 0 0 1-2-2v-3.5a2 2 0 0 1 2-2h13a2 2 0 0 1 2 2V14a2 2 0 0 1-2 2H17M8.2 13.5H15.8A1.2 1.2 0 0 1 17 14.7V18.3A1.2 1.2 0 0 1 15.8 19.5H8.2A1.2 1.2 0 0 1 7 18.3V14.7A1.2 1.2 0 0 1 8.2 13.5Z",
+["progress"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM12 3.4v8.6l6.1 6.1A8.6 8.6 0 0 0 12 3.4Z",
+["puzzle"]="M10 4.5a2 2 0 0 1 4 0v1.5h3.5a1 1 0 0 1 1 1V10.5h1.5a2 2 0 0 1 0 4h-1.5V19a1 1 0 0 1-1 1H14v-1.5a2 2 0 0 0-4 0V20H5.5a1 1 0 0 1-1-1v-4.5H6a2 2 0 0 0 0-4H4.5V7a1 1 0 0 1 1-1H10Z",
+["qr-code"]="M5.4 4H8.6A1.4 1.4 0 0 1 10 5.4V8.6A1.4 1.4 0 0 1 8.6 10H5.4A1.4 1.4 0 0 1 4 8.6V5.4A1.4 1.4 0 0 1 5.4 4ZM15.4 4H18.6A1.4 1.4 0 0 1 20 5.4V8.6A1.4 1.4 0 0 1 18.6 10H15.4A1.4 1.4 0 0 1 14 8.6V5.4A1.4 1.4 0 0 1 15.4 4ZM5.4 14H8.6A1.4 1.4 0 0 1 10 15.4V18.6A1.4 1.4 0 0 1 8.6 20H5.4A1.4 1.4 0 0 1 4 18.6V15.4A1.4 1.4 0 0 1 5.4 14ZM14 14L14 14.1M17 14L20 14M14 17.5L17 17.5M20 17.5L20 20M14 20L17 20M17 17L17 17.1",
+["quest"]="M7.5 4.5h9A2 2 0 0 1 18.5 6.5V17a2.5 2.5 0 0 1-2.5 2.5H8A2.5 2.5 0 0 1 5.5 17V6.5a2 2 0 0 1 2-2ZM12 8L12 12.5D12 15.5 0.7",
+["radar"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM16.5 12A4.5 4.5 0 1 1 7.5 12A4.5 4.5 0 1 1 16.5 12ZM12 12L17.5 6.5D15.8 14.8 1",
+["radio"]="M6.1 9H17.9A2.6 2.6 0 0 1 20.5 11.6V17.4A2.6 2.6 0 0 1 17.9 20H6.1A2.6 2.6 0 0 1 3.5 17.4V11.6A2.6 2.6 0 0 1 6.1 9ZM7 9L17.5 4M18 14.5A2.5 2.5 0 1 1 13 14.5A2.5 2.5 0 1 1 18 14.5ZM6.5 13.5L9.5 13.5M6.5 16.5L9.5 16.5",
+["rainbow"]="M3.5 18.5a8.5 8.5 0 0 1 17 0M7 18.5a5 5 0 0 1 10 0M10.2 18.5a1.8 1.8 0 0 1 3.6 0",
+["rank"]="M5 5.5L12 3.5l7 2v7.5c0 3.5-3 6-7 7.5c-4-1.5-7-4-7-7.5ZM8.5 10.5L12 8l3.5 2.5M8.5 14.5L12 12l3.5 2.5",
+["receipt"]="M6 3.5h12v17l-2-1.3l-2 1.3l-2-1.3l-2 1.3l-2-1.3l-2 1.3ZM9 8.5L15 8.5M9 12L15 12M9 15.5L12.5 15.5",
+["redo"]="M15.5 4.8L19.5 9L15.5 13.2M19.2 9L10 9C7 9 4.5 11.5 4.5 14.5C4.5 17.5 7 20 10 20L14.5 20",
+["refresh-ccw"]="M18.4 8C17 5.7 14.4 4.3 11.7 4.4C9 4.5 6.6 6 5.3 8.4M4.1 4.2L5.3 8.4L9.5 7.1M5.5 16C7 18.3 9.6 19.7 12.3 19.6C15 19.5 17.4 18 18.7 15.6M19.9 19.8L18.7 15.6L14.5 16.9",
+["refresh-cw"]="M5.5 8A7.6 7.6 0 0 1 18.7 8.4M19.9 4.2L18.7 8.4L14.5 7.1M18.4 16A7.6 7.6 0 0 1 5.3 15.6M4.1 19.8L5.3 15.6L9.5 16.9",
+["regex"]="M12 5L12 13M8.3 7L15.7 11M8.3 11L15.7 7D7 18 1.3",
+["rejoin"]="M4 20.5h9M6 20.5V5.5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2V12M20 14.5a3.5 3.5 0 1 1-1-2.4M20.2 10.2V12.5H18",
+["repeat"]="M4 11V10a3 3 0 0 1 3-3h11M15 4l3.5 3L15 10M20 13v1a3 3 0 0 1-3 3H6M9 20l-3.5-3L9 14",
+["respawn"]="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.8 4.2v4.3h-4.3M13.8 10.2A1.8 1.8 0 1 1 10.2 10.2A1.8 1.8 0 1 1 13.8 10.2ZM8.8 16.2c0.5-1.8 1.7-2.7 3.2-2.7s2.7 0.9 3.2 2.7",
+["rewind"]="M20.5 7L20.5 17C20.5 17.3 20.4 17.6 20.1 17.7C19.9 17.8 19.6 17.8 19.3 17.7L12.7 12.7C12.4 12.6 12.3 12.3 12.3 12C12.3 11.7 12.4 11.4 12.7 11.3L19.3 6.3C19.6 6.2 19.9 6.2 20.1 6.3C20.4 6.5 20.5 6.7 20.5 7ZM11.5 7L11.5 17C11.5 17.3 11.3 17.6 11.1 17.7C10.9 17.8 10.6 17.8 10.3 17.7L3.7 12.7C3.5 12.6 3.3 12.3 3.3 12C3.3 11.7 3.5 11.4 3.7 11.3L10.3 6.3C10.6 6.2 10.9 6.2 11.1 6.3C11.3 6.5 11.5 6.7 11.5 7Z",
+["road"]="M8 3.5L4.5 20.5M16 3.5l3.5 17M12 4.5L12 7M12 10.5L12 13.5M12 17L12 19.5",
+["rocket"]="M12 3.5c3.5 2 5.5 5.5 5.5 9.5l-2 2.5h-7L6.5 13c0-4 2-7.5 5.5-9.5ZM13.7 10A1.7 1.7 0 1 1 10.3 10A1.7 1.7 0 1 1 13.7 10ZM9.5 15.5L8 20.5l4-2l4 2l-1.5-5",
+["rotate-cw"]="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.8 4.2v4.3h-4.3",
+["route"]="M8.2 18A2.2 2.2 0 1 1 3.8 18A2.2 2.2 0 1 1 8.2 18ZM20.2 6A2.2 2.2 0 1 1 15.8 6A2.2 2.2 0 1 1 20.2 6ZM8.2 18h6.8a3 3 0 0 0 0-6H9a3 3 0 0 1 0-6h6.8",
+["rss"]="M5 11a8 8 0 0 1 8 8M5 5.5A13.5 13.5 0 0 1 18.5 19D6 18 1.6",
+["ruler"]="M4.7 15.6L15.6 4.7a1.5 1.5 0 0 1 2.1 0l1.6 1.6a1.5 1.5 0 0 1 0 2.1L8.4 19.3a1.5 1.5 0 0 1-2.1 0l-1.6-1.6a1.5 1.5 0 0 1 0-2.1ZM8.5 12.6L10.5 14.6M11 9.6L13 11.6M13.8 7L15.8 9",
+["safe"]="M6.1 4.5H17.9A2.6 2.6 0 0 1 20.5 7.1V15.9A2.6 2.6 0 0 1 17.9 18.5H6.1A2.6 2.6 0 0 1 3.5 15.9V7.1A2.6 2.6 0 0 1 6.1 4.5ZM15.4 11.5A3.4 3.4 0 1 1 8.6 11.5A3.4 3.4 0 1 1 15.4 11.5ZM12 11.5L13.6 10M7 18.5L7 20M17 18.5L17 20",
+["sailboat"]="M12 3.5v12H5.5ZM12 7.5c3 1.8 5 4.5 5.5 8.5H12M3.5 18.5h17l-2.2 2.2H5.7Z",
+["save"]="M5.5 5.5a1 1 0 0 1 1-1h9.2l3.8 3.8V18.5a1 1 0 0 1-1 1h-12a1 1 0 0 1-1-1ZM8.5 4.5V8.5a0.8 0.8 0 0 0 0.8 0.8h5a0.8 0.8 0 0 0 0.8-0.8V4.5M8 19.5v-5a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v5",
+["scale"]="M12 4L12 20M7 20L17 20M4.5 7L19.5 7M4.5 7L2.5 13a2.7 2.7 0 0 0 4 0ZM19.5 7l-2 6a2.7 2.7 0 0 0 4 0Z",
+["scan-eye"]="M4 8V6a2 2 0 0 1 2-2h2M16 4h2a2 2 0 0 1 2 2v2M20 16v2a2 2 0 0 1-2 2h-2M8 20H6a2 2 0 0 1-2-2v-2M7 12s2-3.5 5-3.5s5 3.5 5 3.5s-2 3.5-5 3.5S7 12 7 12ZD12 12 1.2",
+["scissors"]="M9 6.5A2.5 2.5 0 1 1 4 6.5A2.5 2.5 0 1 1 9 6.5ZM9 17.5A2.5 2.5 0 1 1 4 17.5A2.5 2.5 0 1 1 9 17.5ZM8.3 8.3L19.5 19.5M8.3 15.7L19.5 4.5",
+["scooter"]="M8.2 18A2.2 2.2 0 1 1 3.8 18A2.2 2.2 0 1 1 8.2 18ZM20.2 18A2.2 2.2 0 1 1 15.8 18A2.2 2.2 0 1 1 20.2 18ZM8.2 18H16l-1.5-12.5M12.5 5.5h4",
+["screwdriver"]="M16.9 3.7C17.6 3 18.6 3 19.2 3.7L20.3 4.8C21 5.4 21 6.4 20.3 7L16.4 11C15.8 11.6 14.8 11.6 14.1 11L13 9.9C12.4 9.2 12.4 8.2 13 7.6ZM13.6 10.4L6.1 17.9M5.3 17.2L4.7 19.4L6.8 18.7",
+["script-scroll"]="M7.5 4.5h10a2 2 0 0 1 2 2v1.5H9.5v9.5a2 2 0 0 1-4 0V6.5a2 2 0 0 1 2-2ZM9.5 17.5a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2V16h-8M12.5 11L16.5 11M12.5 13.8L16.5 13.8",
+["search"]="M17 10.5A6.5 6.5 0 1 1 4 10.5A6.5 6.5 0 1 1 17 10.5ZM15.3 15.3L20 20",
+["send"]="M20.5 3.5L3.5 10.7l6.6 2.8l2.8 6.6ZM10.1 13.5L20.5 3.5",
+["send-message"]="M20.5 4L3.5 10l6.5 2.8L12.8 19.5ZM10 12.8L20.5 4",
+["server"]="M6.2 4H17.8A2.2 2.2 0 0 1 20 6.2V8.3A2.2 2.2 0 0 1 17.8 10.5H6.2A2.2 2.2 0 0 1 4 8.3V6.2A2.2 2.2 0 0 1 6.2 4ZM6.2 13.5H17.8A2.2 2.2 0 0 1 20 15.7V17.8A2.2 2.2 0 0 1 17.8 20H6.2A2.2 2.2 0 0 1 4 17.8V15.7A2.2 2.2 0 0 1 6.2 13.5ZD8 7.2 1D8 16.8 1M12 7.2L16 7.2M12 16.8L16 16.8",
+["server-hop"]="M5.3 4H12.7A1.8 1.8 0 0 1 14.5 5.8V7.7A1.8 1.8 0 0 1 12.7 9.5H5.3A1.8 1.8 0 0 1 3.5 7.7V5.8A1.8 1.8 0 0 1 5.3 4ZM5.3 11H12.7A1.8 1.8 0 0 1 14.5 12.8V14.7A1.8 1.8 0 0 1 12.7 16.5H5.3A1.8 1.8 0 0 1 3.5 14.7V12.8A1.8 1.8 0 0 1 5.3 11ZD6.5 6.8 0.8D6.5 13.8 0.8M16.5 10.2L20.5 10.2M18.5 8l2 2.2l-2 2.2M3.5 20L14.5 20",
+["settings"]="M10.4 5.3L10.8 2.9L13.2 2.9L13.6 5.3A6.9 6.9 0 0 1 15.6 6.1L17.6 4.7L19.3 6.4L17.9 8.4A6.9 6.9 0 0 1 18.7 10.4L21.1 10.8L21.1 13.2L18.7 13.6A6.9 6.9 0 0 1 17.9 15.6L19.3 17.6L17.6 19.3L15.6 17.9A6.9 6.9 0 0 1 13.6 18.7L13.2 21.1L10.8 21.1L10.4 18.7A6.9 6.9 0 0 1 8.4 17.9L6.4 19.3L4.7 17.6L6.1 15.6A6.9 6.9 0 0 1 5.3 13.6L2.9 13.2L2.9 10.8L5.3 10.4A6.9 6.9 0 0 1 6.1 8.4L4.7 6.4L6.4 4.7L8.4 6.1A6.9 6.9 0 0 1 10.4 5.3ZM14.8 12A2.8 2.8 0 1 1 9.2 12A2.8 2.8 0 1 1 14.8 12Z",
+["settings-2"]="M9.2 5.4L10 3L14 3L14.8 5.4A7.2 7.2 0 0 1 16.4 6.3L18.8 5.8L20.8 9.2L19.1 11.1A7.2 7.2 0 0 1 19.1 12.9L20.8 14.8L18.8 18.2L16.4 17.7A7.2 7.2 0 0 1 14.8 18.6L14 21L10 21L9.2 18.6A7.2 7.2 0 0 1 7.6 17.7L5.2 18.2L3.2 14.8L4.9 12.9A7.2 7.2 0 0 1 4.9 11.1L3.2 9.2L5.2 5.8L7.6 6.3A7.2 7.2 0 0 1 9.2 5.4ZM14.6 12A2.6 2.6 0 1 1 9.4 12A2.6 2.6 0 1 1 14.6 12Z",
+["share"]="M5 12.5v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5M12 15L12 4M7.8 8L12 3.8L16.2 8",
+["share-2"]="M14 5l6 5.5l-6 5.5v-3.2c-4 0-7 1-9 4.5c0.5-5 3.5-8.5 9-9.3Z",
+["share-nodes"]="M9 12A2.5 2.5 0 1 1 4 12A2.5 2.5 0 1 1 9 12ZM20 6A2.5 2.5 0 1 1 15 6A2.5 2.5 0 1 1 20 6ZM20 18A2.5 2.5 0 1 1 15 18A2.5 2.5 0 1 1 20 18ZM8.8 10.8L15.2 7.2M8.8 13.2L15.2 16.8",
+["shield"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6Z",
+["shield-alert"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6ZM12 8.3L12 12.2D12 15.2 0.5",
+["shield-check"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6ZM8.8 12.1l2.3 2.3l4.2-4.5",
+["shield-half"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6ZM12 3.3V20.7c-4-1.5-7-4.7-7-9.1V6Z",
+["shield-lock"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6ZM10.2 11H13.8A1 1 0 0 1 14.8 12V14.4A1 1 0 0 1 13.8 15.4H10.2A1 1 0 0 1 9.2 14.4V12A1 1 0 0 1 10.2 11ZM10.3 11v-0.8a1.7 1.7 0 0 1 3.4 0V11",
+["shield-off"]="M9.5 4.4L12 3.3L19 6v5.6a9.5 9.5 0 0 1-0.7 3.5M16.2 18.2A10 10 0 0 1 12 20.7c-4-1.5-7-4.7-7-9.1V6l1.5-0.6M4 4L20 20",
+["shield-plus"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6ZM12 8.8L12 14.2M9.3 11.5L14.7 11.5",
+["shield-sword"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6ZM12 7L12 14.5M9.8 10L14.2 10",
+["shield-x"]="M12 3.3L19 6v5.6c0 4.4-3 7.6-7 9.1c-4-1.5-7-4.7-7-9.1V6ZM9.7 9.7l4.6 4.6M14.3 9.7l-4.6 4.6",
+["ship"]="M3.5 14.5L12 12l8.5 2.5l-1.8 3.8a2 2 0 0 1-1.8 1.2H7.1a2 2 0 0 1-1.8-1.2ZM12 12V7.5M9 9.5h6M12 4v3.5",
+["shopping-bag"]="M5.5 8h13l1 11.2a1 1 0 0 1-1 1.1H5.5a1 1 0 0 1-1-1.1ZM8.5 10.5V7a3.5 3.5 0 0 1 7 0v3.5",
+["shopping-cart"]="M3.5 4.5h2.3l2 10h9.8l1.9-7.2H7M10.9 19A1.4 1.4 0 1 1 8.1 19A1.4 1.4 0 1 1 10.9 19ZM17.9 19A1.4 1.4 0 1 1 15.1 19A1.4 1.4 0 1 1 17.9 19Z",
+["shrink"]="M9.5 4.5V8A1.5 1.5 0 0 1 8 9.5H4.5M19.5 9.5H16A1.5 1.5 0 0 1 14.5 8V4.5M14.5 19.5V16a1.5 1.5 0 0 1 1.5-1.5h3.5M4.5 14.5H8A1.5 1.5 0 0 1 9.5 16v3.5",
+["shuffle"]="M4 7h2.5a4.5 4.5 0 0 1 3.6 1.8l3.8 5.4a4.5 4.5 0 0 0 3.6 1.8H20M17 13.5l3 2.5l-3 2.5M4 17h2.5a4.5 4.5 0 0 0 3.1-1.2M13.9 8.2A4.5 4.5 0 0 1 17 7h3M17 4.5L20 7l-3 2.5",
+["sidebar"]="M6.1 4.5H17.9A2.6 2.6 0 0 1 20.5 7.1V16.9A2.6 2.6 0 0 1 17.9 19.5H6.1A2.6 2.6 0 0 1 3.5 16.9V7.1A2.6 2.6 0 0 1 6.1 4.5ZM9.5 4.5L9.5 19.5",
+["signal"]="M5 19L5 16M9.7 19L9.7 13M14.3 19L14.3 9.5M19 19L19 5.5",
+["signpost"]="M12 3.5L12 20.5M5.5 6.5h10.3l2.7 2.6l-2.7 2.6H5.5ZM18.5 14.2H8.2l-2.7 2.6l2.7 2.6h10.3Z",
+["siren"]="M6.5 18.5v-5a5.5 5.5 0 0 1 11 0v5ZM4 20.5h16M12 3L12 4.5M4.2 6L5.3 7M19.8 6L18.7 7M9.5 12.5L9.5 14.5",
+["skip-back"]="M18 6.2L18 17.8C18 18.1 17.9 18.4 17.6 18.5C17.4 18.6 17.1 18.6 16.8 18.5L8.2 12.7C8 12.6 7.8 12.3 7.8 12C7.8 11.7 8 11.4 8.2 11.3L16.8 5.5C17.1 5.4 17.4 5.4 17.6 5.5C17.9 5.7 18 5.9 18 6.2ZM5.5 5.5L5.5 18.5",
+["skip-forward"]="M6 6.2v11.6a0.8 0.8 0 0 0 1.2 0.7l8.6-5.8a0.8 0.8 0 0 0 0-1.4L7.2 5.5A0.8 0.8 0 0 0 6 6.2ZM18.5 5.5L18.5 18.5",
+["skull"]="M12 3.5c-4.4 0-7.5 3-7.5 7c0 2.5 1.2 4.2 3 5.2V19a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-3.3c1.8-1 3-2.7 3-5.2c0-4-3.1-7-7.5-7ZM10.5 11A1.5 1.5 0 1 1 7.5 11A1.5 1.5 0 1 1 10.5 11ZM16.5 11A1.5 1.5 0 1 1 13.5 11A1.5 1.5 0 1 1 16.5 11ZM12 13.5L11 15.5M10.5 17.5L10.5 20M13.5 17.5L13.5 20",
+["sleep"]="M5 5.5h5.5L5 12h5.5M13 12h4.5L13 17.5h4.5M16.5 4h3l-3 3.2h3",
+["sliders"]="M4 7L20 7M4 17L20 17M11.4 7A2.4 2.4 0 1 1 6.6 7A2.4 2.4 0 1 1 11.4 7ZM17.4 17A2.4 2.4 0 1 1 12.6 17A2.4 2.4 0 1 1 17.4 17Z",
+["sliders-vertical"]="M7 4L7 20M17 4L17 20M9.4 15A2.4 2.4 0 1 1 4.6 15A2.4 2.4 0 1 1 9.4 15ZM19.4 9A2.4 2.4 0 1 1 14.6 9A2.4 2.4 0 1 1 19.4 9Z",
+["smartphone"]="M9.6 3.5H14.4A2.6 2.6 0 0 1 17 6.1V17.9A2.6 2.6 0 0 1 14.4 20.5H9.6A2.6 2.6 0 0 1 7 17.9V6.1A2.6 2.6 0 0 1 9.6 3.5ZM10.5 17.5L13.5 17.5",
+["smile"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM8.2 14.2a4.6 4.6 0 0 0 7.6 0D9 9.8 0.9D15 9.8 0.9",
+["snowflake"]="M12 3.5L12 20.5M4.6 7.8L19.4 16.2M4.6 16.2L19.4 7.8M9.5 5.5L12 7.5l2.5-2M9.5 18.5L12 16.5l2.5 2",
+["sort"]="M5 7L13 7M5 12L10 12M5 17L7 17M16.5 16.5V6.5M13.5 13.5l3 3l3-3",
+["sparkle"]="M12 3.5c0.6 4.6 2.5 6.7 8 8.5c-5.5 1.8-7.4 3.9-8 8.5c-0.6-4.6-2.5-6.7-8-8.5c5.5-1.8 7.4-3.9 8-8.5Z",
+["speed-boots"]="M9 4h5v6l4 2a2.5 2.5 0 0 1 1.5 2.3V17a1.5 1.5 0 0 1-1.5 1.5H9A1.5 1.5 0 0 1 7.5 17V5.5A1.5 1.5 0 0 1 9 4ZM2.5 9L5.5 9M2.5 13L5.5 13",
+["spell-book"]="M6.5 3.5h11A1.5 1.5 0 0 1 19 5v13.5a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 18.5V5a1.5 1.5 0 0 1 1.5-1.5ZM12 7.5l1.1 2.4l2.6 0.3l-1.9 1.8l0.5 2.6l-2.3-1.3l-2.3 1.3l0.5-2.6l-1.9-1.8l2.6-0.3Z",
+["spinner"]="M20.5 12a8.5 8.5 0 1 1-8.5-8.5",
+["sprout"]="M12 20.5L12 11.5M12 11.5c0-3.5-2.5-5.5-7-5.5c0 3.5 2.5 5.5 7 5.5ZM12 13.5c0-3 2-5 7-5c0 3-2 5-7 5Z",
+["star"]="M12 3.8l2.5 5.2l5.7 0.8l-4.1 4l1 5.7l-5.1-2.7l-5.1 2.7l1-5.7l-4.1-4l5.7-0.8Z",
+["stop"]="M8.1 5.5H15.9A2.6 2.6 0 0 1 18.5 8.1V15.9A2.6 2.6 0 0 1 15.9 18.5H8.1A2.6 2.6 0 0 1 5.5 15.9V8.1A2.6 2.6 0 0 1 8.1 5.5Z",
+["stop-circle"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM10.4 9.2H13.6A1.2 1.2 0 0 1 14.8 10.4V13.6A1.2 1.2 0 0 1 13.6 14.8H10.4A1.2 1.2 0 0 1 9.2 13.6V10.4A1.2 1.2 0 0 1 10.4 9.2Z",
+["store"]="M4 9.5L5.5 4.5h13L20 9.5a2.6 2.6 0 0 1-5.3 0a2.6 2.6 0 0 1-5.4 0A2.6 2.6 0 0 1 4 9.5ZM5.5 12v7.5a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V12M10 20.5v-4a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v4",
+["submarine"]="M3.5 13a4.5 4.5 0 0 1 4.5-4.5h8.5a4.5 4.5 0 0 1 0 9H8A4.5 4.5 0 0 1 3.5 13ZM11 8.5V5.5h3v3M12 5.5V4M10.2 13A1.2 1.2 0 1 1 7.8 13A1.2 1.2 0 1 1 10.2 13ZM14.2 13A1.2 1.2 0 1 1 11.8 13A1.2 1.2 0 1 1 14.2 13ZM21 11.5L21 14.5",
+["subtitles"]="M5.8 5.5H18.2A2.8 2.8 0 0 1 21 8.3V15.7A2.8 2.8 0 0 1 18.2 18.5H5.8A2.8 2.8 0 0 1 3 15.7V8.3A2.8 2.8 0 0 1 5.8 5.5ZM7 11.5L10 11.5M13 11.5L17 11.5M7 15L12 15M15 15L17 15",
+["sun"]="M16 12A4 4 0 1 1 8 12A4 4 0 1 1 16 12ZM12 3L12 5M12 19L12 21M3 12L5 12M19 12L21 12M5.6 5.6L7 7M17 17L18.4 18.4M5.6 18.4L7 17M17 7L18.4 5.6",
+["sunrise"]="M7 16a5 5 0 0 1 10 0M3 19.5L21 19.5M12 5L12 8M4.6 10.5L6.2 11.8M19.4 10.5L17.8 11.8M9.5 6.5L12 4l2.5 2.5",
+["sword"]="M21.6 3.4C21.3 5.7 20 8.4 17.9 10.5L11.7 16.7L8.3 13.3L14.5 7.1C16.6 5 19.3 3.7 21.6 3.4ZM5.9 10.1C6.3 12.8 12.2 18.7 14.9 19.1M9.4 15.6L6.7 18.3M6.4 20.5C5.9 21.1 5 21.1 4.5 20.5C3.9 20 3.9 19.1 4.5 18.6C5 18 5.9 18 6.4 18.6C7 19.1 7 20 6.4 20.5Z",
+["swords"]="M19 4.4C18.7 6 17.9 7.7 16.4 9.2L11.2 14.4L9 12.2L14.2 7C15.7 5.5 17.4 4.7 19 4.4ZM6.4 11.2C6.8 12.8 10.6 16.6 12.2 17M8.6 14.8L6.9 16.5M5 4.4C6.6 4.7 8.3 5.5 9.8 7L15 12.2L12.8 14.4L7.6 9.2C6.2 7.7 5.3 6 5 4.4ZM11.8 17C13.4 16.6 17.2 12.8 17.6 11.2M15.4 14.8L17.1 16.5",
+["tablet"]="M7.6 3.5H16.4A2.6 2.6 0 0 1 19 6.1V17.9A2.6 2.6 0 0 1 16.4 20.5H7.6A2.6 2.6 0 0 1 5 17.9V6.1A2.6 2.6 0 0 1 7.6 3.5ZM10.5 17.5L13.5 17.5",
+["tag"]="M3.8 12.3V5.5a1.7 1.7 0 0 1 1.7-1.7h6.8a1.7 1.7 0 0 1 1.2 0.5l7.3 7.3a1.7 1.7 0 0 1 0 2.4l-6.8 6.8a1.7 1.7 0 0 1-2.4 0l-7.3-7.3a1.7 1.7 0 0 1-0.5-1.2ZD8 8 1.1",
+["tanker"]="M2.5 14.5h19l-2 3.8a2 2 0 0 1-1.8 1.2H6.3a2 2 0 0 1-1.8-1.2ZM5 14.5v-2a1.5 1.5 0 0 1 1.5-1.5h9a1.5 1.5 0 0 1 1.5 1.5v2M10.5 11L10.5 14.5M18.5 14.5V7.5h-2V9M17.5 7.5v-2",
+["target"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM16.8 12A4.8 4.8 0 1 1 7.2 12A4.8 4.8 0 1 1 16.8 12ZD12 12 1.3",
+["target-check"]="M20 12.5a8 8 0 1 1-8-8M12 8.5a4 4 0 1 0 4 4M12 12.5L20.5 4M17 4h3.5v3.5",
+["taxi"]="M5 16.5v-3.2a2 2 0 0 1 0.3-1l1.8-3.8a2 2 0 0 1 1.8-1.2h6.2a2 2 0 0 1 1.8 1.2l1.8 3.8a2 2 0 0 1 0.3 1v3.2a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1ZM10 5.5V4h4v1.5M5.2 12.5L18.8 12.5D8.5 15 0.9D15.5 15 0.9",
+["teleport"]="M3.5 12L12.5 12M9 8.5L12.5 12L9 15.5M18 6.5a3 5.5 0 1 0 0 11a3 5.5 0 1 0 0-11Z",
+["terminal"]="M5 7.5L10 12l-5 4.5M12.5 17L19 17",
+["terminal-window"]="M6.1 4.5H17.9A2.6 2.6 0 0 1 20.5 7.1V16.9A2.6 2.6 0 0 1 17.9 19.5H6.1A2.6 2.6 0 0 1 3.5 16.9V7.1A2.6 2.6 0 0 1 6.1 4.5ZM7.5 9.8l2.7 2.2l-2.7 2.2M12.5 14.5L16 14.5",
+["thermometer"]="M10 14.2V5.5a2 2 0 0 1 4 0v8.7a4 4 0 1 1-4 0ZM13.2 16.5A1.2 1.2 0 1 1 10.8 16.5A1.2 1.2 0 1 1 13.2 16.5ZM12 8L12 15",
+["thumbs-down"]="M8 13V4.5H5.5A1.5 1.5 0 0 0 4 6v5.5A1.5 1.5 0 0 0 5.5 13ZM8 13l3.5 6.5a1.8 1.8 0 0 0 3.3-1.2L14 14.5h4.7a1.8 1.8 0 0 0 1.8-2.2l-1.3-6A2.2 2.2 0 0 0 17 4.5H8",
+["thumbs-up"]="M8 11V19.5H5.5A1.5 1.5 0 0 1 4 18v-5.5A1.5 1.5 0 0 1 5.5 11ZM8 11l3.5-6.5a1.8 1.8 0 0 1 3.3 1.2L14 9.5h4.7a1.8 1.8 0 0 1 1.8 2.2l-1.3 6A2.2 2.2 0 0 1 17 19.5H8",
+["timer"]="M19.2 13.5A7.2 7.2 0 1 1 4.8 13.5A7.2 7.2 0 1 1 19.2 13.5ZM9.8 3.5L14.2 3.5M12 3.5L12 6.3M12 10v3.5l2.2 1.4M18.3 7.2L19.5 6",
+["toggle-left"]="M8 7H16A5 5 0 0 1 21 12V12A5 5 0 0 1 16 17H8A5 5 0 0 1 3 12V12A5 5 0 0 1 8 7ZM10.2 12A2.2 2.2 0 1 1 5.8 12A2.2 2.2 0 1 1 10.2 12Z",
+["toggle-right"]="M8 7H16A5 5 0 0 1 21 12V12A5 5 0 0 1 16 17H8A5 5 0 0 1 3 12V12A5 5 0 0 1 8 7ZM18.2 12A2.2 2.2 0 1 1 13.8 12A2.2 2.2 0 1 1 18.2 12Z",
+["tools"]="M19.1 2.8L16.2 5.7C15.6 6.3 15.6 7.2 16.2 7.8C16.8 8.4 17.7 8.4 18.3 7.8L21.2 4.9C22.1 6.6 21.8 8.7 20.5 10.1C19.2 11.4 17.1 11.9 15.4 11.2L6.5 20.1C5.8 20.8 4.6 20.8 3.9 20.1C3.2 19.4 3.2 18.2 3.9 17.5L12.8 8.6C12.1 6.9 12.6 4.8 13.9 3.5C15.3 2.2 17.4 1.9 19.1 2.8ZM3.9 6.8C3 6 3 5.1 3.9 4.3L4.3 3.9C5.1 3 6 3 6.8 3.9L10.2 7.3C10.9 7.9 10.9 8.6 10.2 9.2L9.2 10.2C8.6 10.9 7.9 10.9 7.3 10.2ZM9.7 9.7L17.9 17.9M17.1 18.8L19.2 19.2L18.8 17.1",
+["tornado"]="M4 5L20 5M6 9L18 9M8 13L16 13M10 17L14 17M11.5 20.5L12.5 20.5",
+["traffic-cone"]="M10 4.5h4L18.5 18h-13ZM7.8 12L16.2 12M3.5 20.5h17",
+["train"]="M8 3.5h8a3 3 0 0 1 3 3V15a3 3 0 0 1-3 3H8a3 3 0 0 1-3-3V6.5a3 3 0 0 1 3-3ZM5 10.5L19 10.5D8.5 14.5 0.9D15.5 14.5 0.9M8 18L6 21M16 18L18 21",
+["tram"]="M8 6.5H16A3 3 0 0 1 19 9.5V14.5A3 3 0 0 1 16 17.5H8A3 3 0 0 1 5 14.5V9.5A3 3 0 0 1 8 6.5ZM5 12L19 12M9.5 3.5L14.5 3.5M12 3.5L12 6.5D8.5 14.8 0.8D15.5 14.8 0.8M7 17.5L5.5 20.5M17 17.5L18.5 20.5",
+["trash"]="M4 6.5L20 6.5M9.5 6.5V5a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 14.5 5v1.5M6.2 6.5l0.8 11.8a2 2 0 0 0 2 1.7h6a2 2 0 0 0 2-1.7l0.8-11.8M10 10.5L10 16M14 10.5L14 16",
+["treasure-chest"]="M4 11V8.5a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3V11ZM5.5 11H18.5A1.5 1.5 0 0 1 20 12.5V18A1.5 1.5 0 0 1 18.5 19.5H5.5A1.5 1.5 0 0 1 4 18V12.5A1.5 1.5 0 0 1 5.5 11ZM11.4 9.8H12.6A0.9 0.9 0 0 1 13.5 10.7V12.7A0.9 0.9 0 0 1 12.6 13.6H11.4A0.9 0.9 0 0 1 10.5 12.7V10.7A0.9 0.9 0 0 1 11.4 9.8Z",
+["tree"]="M12 3.5c-3 2.5-5.5 5.5-5.5 8.5a3 3 0 0 0 2 2.8c-1.7 0.8-3 2.2-3 3.7h13c0-1.5-1.3-2.9-3-3.7a3 3 0 0 0 2-2.8c0-3-2.5-6-5.5-8.5ZM12 18.5L12 20.5",
+["trending-down"]="M3.5 7l6 6l3.5-3.5l7.5 7.5M15 17h5.5v-5.5",
+["trending-up"]="M3.5 17l6-6l3.5 3.5L20.5 7M15 7h5.5v5.5",
+["trophy"]="M7.5 4h9v5a4.5 4.5 0 0 1-9 0ZM7.5 6H4.5v1.5A3.5 3.5 0 0 0 8 11M16.5 6h3v1.5A3.5 3.5 0 0 1 16 11M12 13.5L12 17M8.5 20.5v-1.5a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v1.5Z",
+["truck"]="M3 6.5a1.5 1.5 0 0 1 1.5-1.5h8A1.5 1.5 0 0 1 14 6.5V16H3ZM14 9.5h3.5l3 3.5V16H14ZM9 17.5A2 2 0 1 1 5 17.5A2 2 0 1 1 9 17.5ZM18.5 17.5A2 2 0 1 1 14.5 17.5A2 2 0 1 1 18.5 17.5Z",
+["ufo"]="M3.5 14.5c0-1.5 3.8-2.8 8.5-2.8s8.5 1.3 8.5 2.8s-3.8 2.8-8.5 2.8S3.5 16 3.5 14.5ZM7.5 12.5C7.5 9.5 9.5 7 12 7s4.5 2.5 4.5 5.5M7.5 19L6.5 21M12 19.3L12 21.5M16.5 19L17.5 21",
+["umbrella"]="M3.5 12.5a8.5 8.5 0 0 1 17 0c-1.5-1.5-3.2-1.5-4.2 0c-1.1-1.5-3.1-1.5-4.2 0c-1.1-1.5-3.1-1.5-4.2 0c-1.1-1.5-2.8-1.5-4.2 0ZM12 12.5V18a2 2 0 0 0 4 0M12 4L12 3.5",
+["undo"]="M8.5 4.8L4.5 9l4 4.2M4.8 9H14a5.5 5.5 0 0 1 0 11H9.5",
+["unlink"]="M10 14a4.2 4.2 0 0 0 5.9 0.4l3-3a4.2 4.2 0 0 0-5.9-5.9l-0.5 0.5M14 10a4.2 4.2 0 0 0-5.9-0.4l-3 3a4.2 4.2 0 0 0 5.9 5.9l0.5-0.5M3.5 3.5L6 6M18 18L20.5 20.5",
+["unlock"]="M7.8 10.5H16.2A2.8 2.8 0 0 1 19 13.3V17.7A2.8 2.8 0 0 1 16.2 20.5H7.8A2.8 2.8 0 0 1 5 17.7V13.3A2.8 2.8 0 0 1 7.8 10.5ZM8 10.5V8a4 4 0 0 1 7.7-1.5D12 15.5 1.2",
+["upload"]="M12 15L12 4M7.5 8.5L12 4l4.5 4.5M4.5 15.5v2a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2v-2",
+["usb"]="M12 3.5L12 17M8.8 10.5L12 13.5l3.2-3M13.8 19A1.8 1.8 0 1 1 10.2 19A1.8 1.8 0 1 1 13.8 19ZM10 6.5l2-3l2 3ZM7 8.5h3v3H7ZM18.7 9A1.2 1.2 0 1 1 16.3 9A1.2 1.2 0 1 1 18.7 9Z",
+["user"]="M15.8 8A3.8 3.8 0 1 1 8.2 8A3.8 3.8 0 1 1 15.8 8ZM4.8 20c0.8-3.8 3.5-6 7.2-6s6.4 2.2 7.2 6",
+["user-check"]="M13.6 8A3.6 3.6 0 1 1 6.4 8A3.6 3.6 0 1 1 13.6 8ZM3.8 19.5c0.8-3.4 3.3-5 6.2-5s5.4 1.6 6.2 5M16.5 11.5l2 2l3.5-3.8",
+["user-circle"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM14.8 10A2.8 2.8 0 1 1 9.2 10A2.8 2.8 0 1 1 14.8 10ZM6.8 18c1-2.2 2.8-3.2 5.2-3.2s4.2 1 5.2 3.2",
+["user-minus"]="M13.6 8A3.6 3.6 0 1 1 6.4 8A3.6 3.6 0 1 1 13.6 8ZM3.8 19.5c0.8-3.4 3.3-5 6.2-5s4.2 0.8 5.4 2.3M16 13L22 13",
+["user-plus"]="M13.6 8A3.6 3.6 0 1 1 6.4 8A3.6 3.6 0 1 1 13.6 8ZM3.8 19.5c0.8-3.4 3.3-5 6.2-5s4.2 0.8 5.4 2.3M19 10L19 16M16 13L22 13",
+["users"]="M12.3 8.5A3.3 3.3 0 1 1 5.7 8.5A3.3 3.3 0 1 1 12.3 8.5ZM2.8 19.5c0.7-3.3 3.1-5 6.2-5s5.5 1.7 6.2 5M15.5 5.5a3.3 3.3 0 0 1 0 6M17.5 14.8c1.8 0.6 3.1 2.2 3.7 4.7",
+["variable"]="M8 4.5c-2 3-3 5.2-3 7.5s1 4.5 3 7.5M16 4.5c2 3 3 5.2 3 7.5s-1 4.5-3 7.5M9.5 9.5L14.5 14.5M14.5 9.5l-5 5",
+["verified"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM12 7.5l1.3 2.6l2.9 0.4l-2.1 2l0.5 2.9l-2.6-1.4l-2.6 1.4l0.5-2.9l-2.1-2l2.9-0.4Z",
+["video"]="M5.8 6.5H13.2A2.8 2.8 0 0 1 16 9.3V14.7A2.8 2.8 0 0 1 13.2 17.5H5.8A2.8 2.8 0 0 1 3 14.7V9.3A2.8 2.8 0 0 1 5.8 6.5ZM16 10.8l4.2-2.6a0.7 0.7 0 0 1 1 0.6v6.4a0.7 0.7 0 0 1-1 0.6L16 13.2",
+["volcano"]="M3.5 20L9 10h6l5.5 10ZM9 10L7.5 5.5M12 9V4M15 10l1.5-4.5",
+["volume"]="M5 9.5h2.5L12 5.5v13l-4.5-4H5a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1ZM15.5 9a4 4 0 0 1 0 6M18.2 6.5a7.5 7.5 0 0 1 0 11",
+["volume-low"]="M5 9.5h2.5L12 5.5v13l-4.5-4H5a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1ZM15.5 9a4 4 0 0 1 0 6",
+["volume-mute"]="M5 9.5h2.5L12 5.5v13l-4.5-4H5a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1ZM16 9.5l4.5 5M20.5 9.5l-4.5 5",
+["wallet"]="M5 7.5a2 2 0 0 1 2-2h10v3M5 7.5v10a2 2 0 0 0 2 2h11.5a1 1 0 0 0 1-1V9.5a1 1 0 0 0-1-1H7a2 2 0 0 1-2-1ZD16 14 1.1",
+["wand"]="M5 19L15.5 8.5M15 4.5l4.5 4.5l-2.2 2.2L12.8 6.7ZM5 19l-1.2 1.2M6 4L6 7M4.5 5.5L7.5 5.5M19 15L19 18M17.5 16.5L20.5 16.5",
+["waves"]="M3 9c1.5-1.5 3-1.5 4.5 0s3 1.5 4.5 0s3-1.5 4.5 0s3 1.5 4.5 0M3 14c1.5-1.5 3-1.5 4.5 0s3 1.5 4.5 0s3-1.5 4.5 0s3 1.5 4.5 0M3 19c1.5-1.5 3-1.5 4.5 0s3 1.5 4.5 0s3-1.5 4.5 0s3 1.5 4.5 0",
+["webcam"]="M18.5 10A6.5 6.5 0 1 1 5.5 10A6.5 6.5 0 1 1 18.5 10ZM14.5 10A2.5 2.5 0 1 1 9.5 10A2.5 2.5 0 1 1 14.5 10ZM8.5 20.5h7M12 16.5v4",
+["webhook"]="M14.6 7A2.6 2.6 0 1 1 9.4 7A2.6 2.6 0 1 1 14.6 7ZM8.6 18A2.6 2.6 0 1 1 3.4 18A2.6 2.6 0 1 1 8.6 18ZM20.6 18A2.6 2.6 0 1 1 15.4 18A2.6 2.6 0 1 1 20.6 18ZM10.8 9.2L7 15.8M15 15.5l-2-3.5M8.6 18h6.8",
+["wifi"]="M3.2 9.2a13 13 0 0 1 17.6 0M6.2 12.5a8.8 8.8 0 0 1 11.6 0M9.2 15.8a4.5 4.5 0 0 1 5.6 0D12 19 1.2",
+["wifi-off"]="M9.8 5.6A13 13 0 0 1 20.8 9.2M3.2 9.2a13 13 0 0 1 2.6-1.8M6.2 12.5a8.8 8.8 0 0 1 3-1.8M14.4 11.2a8.8 8.8 0 0 1 3.4 1.3M9.2 15.8a4.5 4.5 0 0 1 5.6 0D12 19 1.2M4 4L20 20",
+["wind"]="M3.5 9h10.5a2.8 2.8 0 1 0-2.8-2.8M3.5 14h14.5a2.8 2.8 0 1 1-2.8 2.8M3.5 11.5L8.5 11.5",
+["wizard-hat"]="M12 3.5c0.4 2.5 3 5.5 4 11.5H8c1-6 3.6-9 4-11.5ZM3.5 18L20.5 18M9 12L15 12",
+["workflow"]="M5 3.5H8A1.5 1.5 0 0 1 9.5 5V8A1.5 1.5 0 0 1 8 9.5H5A1.5 1.5 0 0 1 3.5 8V5A1.5 1.5 0 0 1 5 3.5ZM16 14.5H19A1.5 1.5 0 0 1 20.5 16V19A1.5 1.5 0 0 1 19 20.5H16A1.5 1.5 0 0 1 14.5 19V16A1.5 1.5 0 0 1 16 14.5ZM6.5 9.5v3a3 3 0 0 0 3 3h5",
+["wrench"]="M18.8 2.8L15.5 6.1C14.8 6.8 14.8 7.9 15.5 8.5C16.1 9.2 17.2 9.2 17.9 8.5L21.2 5.2C22.1 7.1 21.8 9.5 20.3 11C18.8 12.6 16.5 13.1 14.6 12.3L6.9 19.9C6.1 20.7 4.9 20.7 4.1 19.9C3.3 19.1 3.3 17.9 4.1 17.1L11.7 9.4C10.9 7.5 11.4 5.2 13 3.7C14.5 2.2 16.9 1.9 18.8 2.8Z",
+["x"]="M6 6L18 18M18 6L6 18",
+["x-circle"]="M20.6 12A8.6 8.6 0 1 1 3.4 12A8.6 8.6 0 1 1 20.6 12ZM9.2 9.2l5.6 5.6M14.8 9.2l-5.6 5.6",
+["xp"]="M12 3c0.4 2.8 1.5 4 4.2 4.5c-2.7 0.6-3.8 1.7-4.2 4.5c-0.4-2.8-1.5-3.9-4.2-4.5C10.5 7 11.6 5.8 12 3ZM6.2 15H17.8A2.2 2.2 0 0 1 20 17.2V17.2A2.2 2.2 0 0 1 17.8 19.5H6.2A2.2 2.2 0 0 1 4 17.2V17.2A2.2 2.2 0 0 1 6.2 15ZM7 17.2L12 17.2",
+["zap"]="M13.5 3.5L5.5 13.5h5.8l-0.8 7l8-10h-5.8Z",
+["zoom-in"]="M17 10.5A6.5 6.5 0 1 1 4 10.5A6.5 6.5 0 1 1 17 10.5ZM15.3 15.3L20 20M10.5 8L10.5 13M8 10.5L13 10.5",
+["zoom-out"]="M17 10.5A6.5 6.5 0 1 1 4 10.5A6.5 6.5 0 1 1 17 10.5ZM15.3 15.3L20 20M8 10.5L13 10.5",
+}
+Icons.Alias = {
+	main = "home", combat = "swords", fight = "swords", esp = "eye", visual = "eye", visuals = "eye", gear = "settings",
+	config = "settings", players = "users", aim = "crosshair", aimbot = "crosshair", defense = "shield", bolt = "zap",
+	speed = "zap", misc = "grid", edit = "pencil", add = "plus", arrow = "arrow-right", world = "globe", color = "palette",
+	close = "x", warn = "alert-triangle", warning = "alert-triangle", farm = "sprout", auto = "refresh-cw", loop = "repeat",
+	util = "tools", utility = "tools", refresh = "refresh-cw", mouse = "mouse-pointer", cursor = "mouse-pointer",
+	success = "check-circle", error = "x-circle", delete = "trash", remove = "trash", search = "search", discord = "message-circle",
+	script = "script-scroll", scripts = "script-scroll", exploit = "bug", visualize = "eye", movement = "dash", teleports = "teleport",
+}
+Icons.Custom = {}
+Icons.Flat = {}
+
+local ARGC = { M = 2, L = 2, H = 1, V = 1, C = 6, S = 4, Q = 4, T = 2, A = 7, Z = 0 }
+
+local function NormalizeName(Name)
+	Name = string.lower(tostring(Name))
+	Name = string.gsub(Name, "[%s_]+", "-")
+	return Name
+end
+
+local function Scan(D)
+	local Out = {}
+	local I, N = 1, #D
+	local Cmd = nil
+	local function Skip()
+		while I <= N do
+			local C = string.sub(D, I, I)
+			if C == " " or C == "," or C == "\n" or C == "\t" or C == "\r" then I = I + 1 else break end
+		end
+	end
+	local function Num()
+		Skip()
+		local S, E = string.find(D, "^[%-%+]?%d*%.?%d*", I)
+		if not S or E < S then return nil end
+		local Str = string.sub(D, S, E)
+		local S2, E2 = string.find(D, "^[eE][%-%+]?%d+", E + 1)
+		if S2 then Str = Str .. string.sub(D, S2, E2) E = E2 end
+		I = E + 1
+		return tonumber(Str)
+	end
+	local function Flag()
+		Skip()
+		local C = string.sub(D, I, I)
+		if C == "0" or C == "1" then I = I + 1 return tonumber(C) end
+		return nil
+	end
+	while I <= N do
+		Skip()
+		if I > N then break end
+		local C = string.sub(D, I, I)
+		if string.match(C, "%a") then
+			Cmd = C
+			I = I + 1
+			if string.upper(Cmd) == "Z" then table.insert(Out, { Cmd, {} }) end
+		elseif Cmd == nil then
+			break
+		end
+		local Up = Cmd and string.upper(Cmd)
+		if Up and Up ~= "Z" then
+			local Args = {}
+			local Ok = true
+			local Count = ARGC[Up]
+			for K = 1, Count do
+				local V
+				if Up == "A" and (K == 4 or K == 5) then V = Flag() else V = Num() end
+				if V == nil then Ok = false break end
+				Args[K] = V
+			end
+			if not Ok then break end
+			table.insert(Out, { Cmd, Args })
+			if Cmd == "M" then Cmd = "L" elseif Cmd == "m" then Cmd = "l" end
+		end
+	end
+	return Out
+end
+
+local function ArcToCubics(X1, Y1, Rx, Ry, Rot, Large, Sweep, X, Y)
+	local Result = {}
+	if Rx == 0 or Ry == 0 then return Result end
+	Rx, Ry = math.abs(Rx), math.abs(Ry)
+	local Phi = math.rad(Rot)
+	local Cp, Sp = math.cos(Phi), math.sin(Phi)
+	local Dx, Dy = (X1 - X) / 2, (Y1 - Y) / 2
+	local X1p = Cp * Dx + Sp * Dy
+	local Y1p = -Sp * Dx + Cp * Dy
+	local Lam = X1p * X1p / (Rx * Rx) + Y1p * Y1p / (Ry * Ry)
+	if Lam > 1 then local K = math.sqrt(Lam) Rx = Rx * K Ry = Ry * K end
+	local Num = Rx * Rx * Ry * Ry - Rx * Rx * Y1p * Y1p - Ry * Ry * X1p * X1p
+	local Den = Rx * Rx * Y1p * Y1p + Ry * Ry * X1p * X1p
+	local Co = math.sqrt(math.max(0, Num / Den))
+	if Large == Sweep then Co = -Co end
+	local Cxp = Co * Rx * Y1p / Ry
+	local Cyp = -Co * Ry * X1p / Rx
+	local Cx = Cp * Cxp - Sp * Cyp + (X1 + X) / 2
+	local Cy = Sp * Cxp + Cp * Cyp + (Y1 + Y) / 2
+	local function Ang(Ux, Uy, Vx, Vy) return math.atan2(Ux * Vy - Uy * Vx, Ux * Vx + Uy * Vy) end
+	local T1 = Ang(1, 0, (X1p - Cxp) / Rx, (Y1p - Cyp) / Ry)
+	local Dt = Ang((X1p - Cxp) / Rx, (Y1p - Cyp) / Ry, (-X1p - Cxp) / Rx, (-Y1p - Cyp) / Ry)
+	if Sweep == 0 and Dt > 0 then Dt = Dt - 2 * math.pi end
+	if Sweep == 1 and Dt < 0 then Dt = Dt + 2 * math.pi end
+	local Nseg = math.max(1, math.ceil(math.abs(Dt) / (math.pi / 2) - 1e-9))
+	local D = Dt / Nseg
+	local K = 4 / 3 * math.tan(D / 4)
+	for Idx = 0, Nseg - 1 do
+		local A1 = T1 + Idx * D
+		local A2 = A1 + D
+		local function Pt(A) return Cx + Rx * math.cos(A) * Cp - Ry * math.sin(A) * Sp, Cy + Rx * math.cos(A) * Sp + Ry * math.sin(A) * Cp end
+		local function Dv(A) return -Rx * math.sin(A) * Cp - Ry * math.cos(A) * Sp, -Rx * math.sin(A) * Sp + Ry * math.cos(A) * Cp end
+		local P1x, P1y = Pt(A1)
+		local P2x, P2y = Pt(A2)
+		local D1x, D1y = Dv(A1)
+		local D2x, D2y = Dv(A2)
+		local Ex, Ey = P2x, P2y
+		if Idx == Nseg - 1 then Ex, Ey = X, Y end
+		table.insert(Result, { P1x + K * D1x, P1y + K * D1y, P2x - K * D2x, P2y - K * D2y, Ex, Ey })
+	end
+	return Result
+end
+
+local function Flatten(D)
+	local Subs, Dots = {}, {}
+	local Cur = nil
+	local Cx, Cy, Sx, Sy = 0, 0, 0, 0
+	local LastCx, LastCy, LastQx, LastQy = nil, nil, nil, nil
+	local function Push(X, Y)
+		if Cur then table.insert(Cur.pts, X) table.insert(Cur.pts, Y) end
+		Cx, Cy = X, Y
+	end
+	local function Cubic(X1, Y1, X2, Y2, X3, Y3)
+		local L = math.sqrt((X1 - Cx) ^ 2 + (Y1 - Cy) ^ 2) + math.sqrt((X2 - X1) ^ 2 + (Y2 - Y1) ^ 2) + math.sqrt((X3 - X2) ^ 2 + (Y3 - Y2) ^ 2)
+		local N = math.clamp(math.ceil(L / 0.9), 3, 40)
+		local X0, Y0 = Cx, Cy
+		for I = 1, N do
+			local T = I / N
+			local U = 1 - T
+			local A, B, C, E = U * U * U, 3 * U * U * T, 3 * U * T * T, T * T * T
+			Push(A * X0 + B * X1 + C * X2 + E * X3, A * Y0 + B * Y1 + C * Y2 + E * Y3)
+		end
+	end
+	for _, Item in ipairs(Scan(D)) do
+		local Cmd, A = Item[1], Item[2]
+		local Up = string.upper(Cmd)
+		local Rel = Cmd ~= Up
+		local Ox, Oy = 0, 0
+		if Rel then Ox, Oy = Cx, Cy end
+		if Up == "M" then
+			Cur = { pts = {}, closed = false }
+			table.insert(Subs, Cur)
+			Cx, Cy = A[1] + Ox, A[2] + Oy
+			Sx, Sy = Cx, Cy
+			table.insert(Cur.pts, Cx) table.insert(Cur.pts, Cy)
+			LastCx = nil LastQx = nil
+		elseif Up == "L" then
+			Push(A[1] + Ox, A[2] + Oy) LastCx = nil LastQx = nil
+		elseif Up == "H" then
+			Push(A[1] + (Rel and Cx or 0), Cy) LastCx = nil LastQx = nil
+		elseif Up == "V" then
+			Push(Cx, A[1] + (Rel and Cy or 0)) LastCx = nil LastQx = nil
+		elseif Up == "C" then
+			local X1, Y1, X2, Y2, X, Y = A[1] + Ox, A[2] + Oy, A[3] + Ox, A[4] + Oy, A[5] + Ox, A[6] + Oy
+			Cubic(X1, Y1, X2, Y2, X, Y)
+			LastCx, LastCy, LastQx = X2, Y2, nil
+		elseif Up == "S" then
+			local X2, Y2, X, Y = A[1] + Ox, A[2] + Oy, A[3] + Ox, A[4] + Oy
+			local X1, Y1 = Cx, Cy
+			if LastCx then X1, Y1 = 2 * Cx - LastCx, 2 * Cy - LastCy end
+			Cubic(X1, Y1, X2, Y2, X, Y)
+			LastCx, LastCy, LastQx = X2, Y2, nil
+		elseif Up == "Q" then
+			local Qx, Qy, X, Y = A[1] + Ox, A[2] + Oy, A[3] + Ox, A[4] + Oy
+			local X0, Y0 = Cx, Cy
+			Cubic(X0 + 2 / 3 * (Qx - X0), Y0 + 2 / 3 * (Qy - Y0), X + 2 / 3 * (Qx - X), Y + 2 / 3 * (Qy - Y), X, Y)
+			LastQx, LastQy, LastCx = Qx, Qy, nil
+		elseif Up == "T" then
+			local X, Y = A[1] + Ox, A[2] + Oy
+			local Qx, Qy = Cx, Cy
+			if LastQx then Qx, Qy = 2 * Cx - LastQx, 2 * Cy - LastQy end
+			local X0, Y0 = Cx, Cy
+			Cubic(X0 + 2 / 3 * (Qx - X0), Y0 + 2 / 3 * (Qy - Y0), X + 2 / 3 * (Qx - X), Y + 2 / 3 * (Qy - Y), X, Y)
+			LastQx, LastQy, LastCx = Qx, Qy, nil
+		elseif Up == "A" then
+			local X, Y = A[6] + Ox, A[7] + Oy
+			local Segs = ArcToCubics(Cx, Cy, A[1], A[2], A[3], A[4], A[5], X, Y)
+			if #Segs == 0 then Push(X, Y) end
+			for _, S in ipairs(Segs) do Cubic(S[1], S[2], S[3], S[4], S[5], S[6]) end
+			LastCx = nil LastQx = nil
+		elseif Up == "Z" then
+			if Cur then
+				Cur.closed = true
+				Cx, Cy = Sx, Sy
+			end
+			LastCx = nil LastQx = nil
+		elseif Up == "D" then
+			table.insert(Dots, { A[1], A[2], A[3] })
+		end
+	end
+	return Subs, Dots
+end
+
+local function ParseDots(Data)
+	local Dots = {}
+	local Clean = string.gsub(Data, "D%s*([%-%d%.]+)[%s,]+([%-%d%.]+)[%s,]+([%-%d%.]+)", function(X, Y, R)
+		table.insert(Dots, { tonumber(X), tonumber(Y), tonumber(R) })
+		return ""
+	end)
+	return Clean, Dots
+end
+
+function Icons:Compile(Data)
+	local Base, Top = Data, nil
+	local Bar = string.find(Data, "|", 1, true)
+	if Bar then Base, Top = string.sub(Data, 1, Bar - 1), string.sub(Data, Bar + 1) end
+	local Clean, Dots = ParseDots(Base)
+	local Subs = Flatten(Clean)
+	local TopSubs = nil
+	if Top then
+		local C2, D2 = ParseDots(Top)
+		TopSubs = Flatten(C2)
+		for _, Dt in ipairs(D2) do table.insert(Dots, Dt) end
+	end
+	if TopSubs then
+		local Cut = {}
+		for _, S in ipairs(TopSubs) do
+			local P = S.pts
+			local N = #P / 2
+			for I = 1, N - 1 do table.insert(Cut, { P[I * 2 - 1], P[I * 2], P[I * 2 + 1], P[I * 2 + 2] }) end
+			if S.closed and N > 2 then table.insert(Cut, { P[N * 2 - 1], P[N * 2], P[1], P[2] }) end
+		end
+		local function Near(X, Y)
+			for _, Sg in ipairs(Cut) do
+				local Dx, Dy = Sg[3] - Sg[1], Sg[4] - Sg[2]
+				local L2 = Dx * Dx + Dy * Dy
+				local T = L2 > 0 and math.clamp(((X - Sg[1]) * Dx + (Y - Sg[2]) * Dy) / L2, 0, 1) or 0
+				local Px, Py = Sg[1] + T * Dx, Sg[2] + T * Dy
+				if (X - Px) ^ 2 + (Y - Py) ^ 2 < 4.6 then return true end
+			end
+			return false
+		end
+		local Kept = {}
+		for _, S in ipairs(Subs) do
+			local P = S.pts
+			local N = #P / 2
+			local Run = nil
+			local function Flush() if Run and #Run >= 4 then table.insert(Kept, { pts = Run, closed = false }) end Run = nil end
+			local Count = S.closed and N or N - 1
+			for I = 1, Count do
+				local Ax, Ay = P[I * 2 - 1], P[I * 2]
+				local J = I % N + 1
+				local Bx, By = P[J * 2 - 1], P[J * 2]
+				local Len = math.sqrt((Bx - Ax) ^ 2 + (By - Ay) ^ 2)
+				local Steps = math.max(1, math.ceil(Len / 0.8))
+				for K = 0, Steps - 1 do
+					local T0, T1 = K / Steps, (K + 1) / Steps
+					local X0, Y0 = Ax + (Bx - Ax) * T0, Ay + (By - Ay) * T0
+					local X1, Y1 = Ax + (Bx - Ax) * T1, Ay + (By - Ay) * T1
+					if Near((X0 + X1) / 2, (Y0 + Y1) / 2) then
+						Flush()
+					else
+						if not Run then Run = { X0, Y0 } end
+						table.insert(Run, X1) table.insert(Run, Y1)
+					end
+				end
+			end
+			Flush()
+		end
+		for _, S in ipairs(TopSubs) do table.insert(Kept, S) end
+		Subs = Kept
+	end
+	return { subs = Subs, dots = Dots }
+end
+
+function Icons:FetchLucide(Name)
+	if self.RemoteEnabled == false or type(Name) ~= "string" then return false end
+	local Key = NormalizeName(Name)
+	if Key == "" or not string.match(Key, "^[a-z0-9%-]+$") or string.find(Key, "%.%.", 1, true) then return false end
+	if self.Remote[Key] then return true end
+
+	
+	local FailedAt = self.RemoteFailureAt[Key]
+	if FailedAt and (os.clock() - FailedAt) < 30 then return false end
+	if type(HttpFetch) ~= "function" then return false end
+
+	local Url = "https://raw.githubusercontent.com/lucide-icons/lucide/main/icons/" .. Key .. ".svg"
+	local Ok, Body = pcall(HttpFetch, Url)
+	if not Ok or type(Body) ~= "string" or #Body == 0 or #Body > 131072 then
+		self.RemoteFailureAt[Key] = os.clock()
+		return false
+	end
+	if not string.find(Body, "<svg", 1, true) then
+		self.RemoteFailureAt[Key] = os.clock()
+		return false
+	end
+
+	local ParsedOk, Data = pcall(function() return self:FromSvgText(Body) end)
+	if not ParsedOk or type(Data) ~= "string" or Data == "" then
+		self.RemoteFailureAt[Key] = os.clock()
+		return false
+	end
+
+	self.Remote[Key] = Data
+	self.RemoteFailureAt[Key] = nil
+	self.Flat[Key] = nil
+	self.Rev = (self.Rev or 0) + 1
+	return true
+end
+
+function Icons:Resolve(Name)
+	if type(Name) ~= "string" then return nil end
+	local Raw = string.lower(Name)
+	local ForceLucide = string.sub(Raw, 1, 7) == "lucide:"
+	local Key = NormalizeName(ForceLucide and string.sub(Raw, 8) or Raw)
+	if Key == "" then return nil end
+	if self.Data[Key] or self.Custom[Key] or self.Remote[Key] then return Key end
+	if ForceLucide then return self:FetchLucide(Key) and Key or nil end
+
+	local A = self.Alias[Key]
+	if A then
+		if self.Data[A] or self.Custom[A] or self.Remote[A] then return A end
+		if self:FetchLucide(A) then return A end
+	end
+	if self:FetchLucide(Key) then return Key end
+	return nil
+end
+
+function Icons:Get(Name)
+	local Key = self:Resolve(Name)
+	if not Key then return nil end
+	local Flat = self.Flat[Key]
+	if not Flat then
+		Flat = self:Compile(self.Custom[Key] or self.Data[Key] or self.Remote[Key])
+		self.Flat[Key] = Flat
+	end
+	return Flat, Key
+end
+
+local function AttrOf(Tag, Name)
+	local V = string.match(Tag, "%f[%w_%-]" .. Name .. "%s*=%s*\"([^\"]*)\"") or string.match(Tag, "%f[%w_%-]" .. Name .. "%s*=%s*'([^']*)'")
+	return V
+end
+
+local function ShapeToPath(Tag, Kind)
+	local function N(Name, Default) return tonumber(AttrOf(Tag, Name)) or Default end
+	if Kind == "path" then return AttrOf(Tag, "d") end
+	if Kind == "circle" then
+		local Cx, Cy, R = N("cx", 0), N("cy", 0), N("r", 0)
+		if R <= 0 then return nil end
+		return string.format("M%f %fA%f %f 0 1 1 %f %fA%f %f 0 1 1 %f %fZ", Cx + R, Cy, R, R, Cx - R, Cy, R, R, Cx + R, Cy)
+	elseif Kind == "ellipse" then
+		local Cx, Cy, Rx, Ry = N("cx", 0), N("cy", 0), N("rx", 0), N("ry", 0)
+		if Rx <= 0 or Ry <= 0 then return nil end
+		return string.format("M%f %fA%f %f 0 1 1 %f %fA%f %f 0 1 1 %f %fZ", Cx + Rx, Cy, Rx, Ry, Cx - Rx, Cy, Rx, Ry, Cx + Rx, Cy)
+	elseif Kind == "line" then
+		return string.format("M%f %fL%f %f", N("x1", 0), N("y1", 0), N("x2", 0), N("y2", 0))
+	elseif Kind == "polyline" or Kind == "polygon" then
+		local Pts = AttrOf(Tag, "points")
+		if not Pts then return nil end
+		local Nums = {}
+		for V in string.gmatch(Pts, "[%-%+]?%d*%.?%d+") do table.insert(Nums, V) end
+		if #Nums < 4 then return nil end
+		local Parts = { "M" .. Nums[1] .. " " .. Nums[2] }
+		for I = 3, #Nums - 1, 2 do table.insert(Parts, "L" .. Nums[I] .. " " .. Nums[I + 1]) end
+		return table.concat(Parts) .. (Kind == "polygon" and "Z" or "")
+	elseif Kind == "rect" then
+		local X, Y, W, H = N("x", 0), N("y", 0), N("width", 0), N("height", 0)
+		local R = math.min(N("rx", N("ry", 0)), W / 2, H / 2)
+		if W <= 0 or H <= 0 then return nil end
+		if R <= 0 then return string.format("M%f %fH%fV%fH%fZ", X, Y, X + W, Y + H, X) end
+		return string.format("M%f %fH%fA%f %f 0 0 1 %f %fV%fA%f %f 0 0 1 %f %fH%fA%f %f 0 0 1 %f %fV%fA%f %f 0 0 1 %f %fZ",
+			X + R, Y, X + W - R, R, R, X + W, Y + R, Y + H - R, R, R, X + W - R, Y + H, X + R, R, R, X, Y + H - R, Y + R, R, R, X + R, Y)
+	end
+	return nil
+end
+
+function Icons:FromSvgText(Text)
+	local Parts = {}
+	local VbX, VbY, VbW = 0, 0, 24
+	local Vb = string.match(Text, "viewBox%s*=%s*\"([^\"]*)\"")
+	if Vb then
+		local Nums = {}
+		for V in string.gmatch(Vb, "[%-%+]?%d*%.?%d+") do table.insert(Nums, tonumber(V)) end
+		if #Nums >= 4 and Nums[3] > 0 then VbX, VbY, VbW = Nums[1], Nums[2], Nums[3] end
+	end
+	for Tag, Kind in string.gmatch(Text, "(<%s*(%a+)[^>]*>)") do
+		local Lower = string.lower(Kind)
+		if Lower == "path" or Lower == "circle" or Lower == "ellipse" or Lower == "line" or Lower == "polyline" or Lower == "polygon" or Lower == "rect" then
+			local P = ShapeToPath(Tag, Lower)
+			if P and P ~= "" then table.insert(Parts, P) end
+		end
+	end
+	if #Parts == 0 then
+		local Direct = string.match(Text, "^%s*([MmLlHhVvCcSsQqTtAaZz][^<>]*)$")
+		if Direct then Parts = { Direct } end
+	end
+	if #Parts == 0 then return nil end
+	local Joined = table.concat(Parts, " ")
+	if VbW ~= 24 or VbX ~= 0 or VbY ~= 0 then
+		local Scale = 24 / VbW
+		local Subs, Dots = Flatten(Joined)
+		local Out = {}
+		for _, S in ipairs(Subs) do
+			local Seg = {}
+			for I = 1, #S.pts, 2 do
+				table.insert(Seg, (I == 1 and "M" or "L") .. string.format("%.2f %.2f", (S.pts[I] - VbX) * Scale, (S.pts[I + 1] - VbY) * Scale))
+			end
+			if S.closed then table.insert(Seg, "Z") end
+			table.insert(Out, table.concat(Seg))
+		end
+		return table.concat(Out)
+	end
+	return Joined
+end
+
+function Icons:Register(Name, Source)
+	if type(Name) ~= "string" or Name == "" or type(Source) ~= "string" then return false end
+	local Data = Source
+	if string.find(Source, "<", 1, true) then Data = self:FromSvgText(Source) end
+	if not Data or Data == "" then return false end
+	local Key = NormalizeName(Name)
+	self.Custom[Key] = Data
+	self.Flat[Key] = nil
+	self.Rev = (self.Rev or 0) + 1
+	return true
+end
+
+function Icons:List()
+	local Out = {}
+	local Seen = {}
+	for K in pairs(self.Data) do Seen[K] = true table.insert(Out, K) end
+	for K in pairs(self.Custom) do if not Seen[K] then Seen[K] = true table.insert(Out, K) end end
+	for K in pairs(self.Remote) do if not Seen[K] then Seen[K] = true table.insert(Out, K) end end
+	table.sort(Out)
+	return Out
+end
+
+function Icons:Draw(Parent, Flat, Size, Color, Thick)
+	local K = Size / 24
+	local T = Thick or math.max(1.75, 2.05 * K)
+	local Items = {}
+	local function Pill(X1, Y1, X2, Y2)
+		local Dx, Dy = (X2 - X1) * K, (Y2 - Y1) * K
+		local Len = math.sqrt(Dx * Dx + Dy * Dy)
+		if Len < 0.02 then return end
+		local F = Instance.new("Frame")
+		F.AnchorPoint = Vector2.new(0.5, 0.5)
+		F.BackgroundColor3 = Color
+		F.BorderSizePixel = 0
+		F.Position = UDim2.new(0, (X1 + X2) / 2 * K, 0, (Y1 + Y2) / 2 * K)
+		F.Size = UDim2.new(0, Len + T, 0, T)
+		F.Rotation = math.deg(math.atan2(Dy, Dx))
+		F.Name = "S"
+		local C = Instance.new("UICorner")
+		C.CornerRadius = UDim.new(0.5, 0)
+		C.Parent = F
+		F.Parent = Parent
+		table.insert(Items, F)
+	end
+	for _, S in ipairs(Flat.subs) do
+		local P = S.pts
+		local N = #P / 2
+		if N == 1 then
+			Pill(P[1], P[2], P[1], P[2] + 0.001)
+		else
+			for I = 1, N - 1 do Pill(P[I * 2 - 1], P[I * 2], P[I * 2 + 1], P[I * 2 + 2]) end
+			if S.closed and N > 2 then Pill(P[N * 2 - 1], P[N * 2], P[1], P[2]) end
+		end
+	end
+	for _, Dt in ipairs(Flat.dots) do
+		local Dia = math.max(Dt[3] * 2 * K, T)
+		local F = Instance.new("Frame")
+		F.AnchorPoint = Vector2.new(0.5, 0.5)
+		F.BackgroundColor3 = Color
+		F.BorderSizePixel = 0
+		F.Position = UDim2.new(0, Dt[1] * K, 0, Dt[2] * K)
+		F.Size = UDim2.new(0, Dia, 0, Dia)
+		F.Name = "D"
+		local C = Instance.new("UICorner")
+		C.CornerRadius = UDim.new(0.5, 0)
+		C.Parent = F
+		F.Parent = Parent
+		table.insert(Items, F)
+	end
+	return Items
+end
+
+local ImageCache = {}
+local ImagePending = {}
+local ImageFolder = "Rexxzy/Cache"
+local ImageSession = {}
+
+local function Fnv(Str, Seed)
+	local H = Seed or 2166136261
+	for I = 1, #Str do
+		H = bit32.bxor(H, string.byte(Str, I))
+		H = (H * 403 + bit32.lshift(H, 24)) % 4294967296
+	end
+	return H
+end
+
+local function HashHex(Str)
+	return string.format("%08x%08x", Fnv(Str), Fnv(Str, 305419896))
+end
+Custom.HashHex = HashHex
+
+HttpFetch = function(Url)
+	local Req = (syn and syn.request) or (http and http.request) or request or http_request
+	if Req then
+		local Ok, R = pcall(Req, { Url = Url, Method = "GET", Headers = { ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36", ["Accept"] = "image/*,text/html,*/*" } })
+		if Ok and type(R) == "table" then
+			local Code = R.StatusCode or R.status_code
+			if (Code == nil or (Code >= 200 and Code < 300)) and type(R.Body) == "string" and #R.Body > 0 then return R.Body end
+		end
+	end
+	local Ok, Body = pcall(function() return game:HttpGet(Url) end)
+	if Ok and type(Body) == "string" and #Body > 0 then return Body end
+	return nil
+end
+
+local function ImageKind(Body)
+	local B = string.sub(Body, 1, 12)
+	if string.sub(B, 1, 4) == "\137PNG" then return "png" end
+	if string.sub(B, 1, 3) == "\255\216\255" then return "jpg" end
+	if string.sub(B, 1, 4) == "RIFF" and string.sub(B, 9, 12) == "WEBP" then return "webp" end
+	if string.sub(B, 1, 2) == "BM" then return "bmp" end
+	if string.sub(B, 1, 3) == "GIF" then return "gif" end
+	return nil
+end
+
+local function Unescape(S)
+	S = string.gsub(S, "&amp;", "&")
+	S = string.gsub(S, "&#38;", "&")
+	S = string.gsub(S, "&quot;", "\"")
+	S = string.gsub(S, "\\u0026", "&")
+	S = string.gsub(S, "\\/", "/")
+	return S
+end
+
+local function ExtractPageImage(Html, Base)
+	local Patterns = {
+		"<meta[^>]-property%s*=%s*[\"']og:image[\"'][^>]-content%s*=%s*[\"']([^\"']+)[\"']",
+		"<meta[^>]-content%s*=%s*[\"']([^\"']+)[\"'][^>]-property%s*=%s*[\"']og:image[\"']",
+		"<meta[^>]-name%s*=%s*[\"']twitter:image[\"'][^>]-content%s*=%s*[\"']([^\"']+)[\"']",
+		"<meta[^>]-content%s*=%s*[\"']([^\"']+)[\"'][^>]-name%s*=%s*[\"']twitter:image[\"']",
+		"<link[^>]-rel%s*=%s*[\"']image_src[\"'][^>]-href%s*=%s*[\"']([^\"']+)[\"']",
+	}
+	for _, P in ipairs(Patterns) do
+		local U = string.match(Html, P)
+		if U then
+			U = Unescape(U)
+			if string.sub(U, 1, 2) == "//" then U = "https:" .. U end
+			if string.sub(U, 1, 4) == "http" then return U end
+		end
+	end
+	return nil
+end
+
+local function NormalizeUrl(Url)
+	Url = string.gsub(Url, "^%s+", "")
+	Url = string.gsub(Url, "%s+$", "")
+	if string.sub(Url, 1, 2) == "//" then Url = "https:" .. Url end
+	local Host = string.match(Url, "^https?://([^/%?#]+)")
+	if not Host then return Url end
+	Host = string.lower(Host)
+	if Host == "www.dropbox.com" or Host == "dropbox.com" then
+		local Path, Query = string.match(Url, "^https?://[^/]+(/[^%?#]*)%??([^#]*)")
+		Query = Query or ""
+		Query = string.gsub(Query, "dl=%d", "")
+		Query = string.gsub(Query, "raw=%d", "")
+		Query = string.gsub(Query, "&&+", "&")
+		Query = string.gsub(Query, "^&", "")
+		Query = string.gsub(Query, "&$", "")
+		return "https://www.dropbox.com" .. Path .. "?" .. (Query ~= "" and (Query .. "&") or "") .. "raw=1"
+	end
+	if Host == "drive.google.com" then
+		local Id = string.match(Url, "/file/d/([%w%-_]+)") or string.match(Url, "[%?&]id=([%w%-_]+)")
+		if Id then return "https://drive.google.com/uc?export=download&id=" .. Id end
+	end
+	if Host == "imgur.com" or Host == "www.imgur.com" then
+		local Id = string.match(Url, "imgur%.com/([%w]+)$") or string.match(Url, "imgur%.com/[%w]+/([%w]+)$")
+		if Id and not string.find(Url, "/a/", 1, true) then return "https://i.imgur.com/" .. Id .. ".png" end
+	end
+	if Host == "github.com" then
+		local User, Repo, Rest = string.match(Url, "github%.com/([^/]+)/([^/]+)/blob/(.+)$")
+		if User then return "https://raw.githubusercontent.com/" .. User .. "/" .. Repo .. "/" .. Rest end
+	end
+	return Url
+end
+
+local function CacheAsset(Path)
+	local Fn = getcustomasset or getsynasset
+	if not Fn then return nil end
+	local Ok, Id = pcall(Fn, Path)
+	if Ok and type(Id) == "string" and Id ~= "" then return Id end
+	return nil
+end
+
+local PngCrc = nil
+local function Crc32(Str)
+	if not PngCrc then
+		PngCrc = {}
+		for I = 0, 255 do
+			local C = I
+			for _ = 1, 8 do
+				if bit32.band(C, 1) == 1 then C = bit32.bxor(bit32.rshift(C, 1), 3988292384) else C = bit32.rshift(C, 1) end
+			end
+			PngCrc[I] = C
+		end
+	end
+	local C = 4294967295
+	local Tbl = PngCrc
+	local Byte = string.byte
+	for I = 1, #Str do
+		C = bit32.bxor(Tbl[bit32.band(bit32.bxor(C, Byte(Str, I)), 255)], bit32.rshift(C, 8))
+	end
+	return bit32.bxor(C, 4294967295)
+end
+
+local function Adler32(Str)
+	local A, B = 1, 0
+	local Byte = string.byte
+	for I = 1, #Str do
+		A = (A + Byte(Str, I)) % 65521
+		B = (B + A) % 65521
+	end
+	return B * 65536 + A
+end
+
+local function PngChunk(Kind, Data)
+	return string.pack(">I4", #Data) .. Kind .. Data .. string.pack(">I4", Crc32(Kind .. Data))
+end
+
+local function EncodePng(W, H, Rows)
+	local Raw = table.concat(Rows)
+	local Parts = { "\120\1" }
+	local Pos, Total = 1, #Raw
+	while Pos <= Total do
+		local Len = math.min(65535, Total - Pos + 1)
+		local Final = (Pos + Len > Total) and 1 or 0
+		table.insert(Parts, string.pack("<I1I2I2", Final, Len, 65535 - Len))
+		table.insert(Parts, string.sub(Raw, Pos, Pos + Len - 1))
+		Pos = Pos + Len
+	end
+	table.insert(Parts, string.pack(">I4", Adler32(Raw)))
+	return "\137PNG\13\10\26\10"
+		.. PngChunk("IHDR", string.pack(">I4I4I1I1I1I1I1", W, H, 8, 6, 0, 0, 0))
+		.. PngChunk("IDAT", table.concat(Parts))
+		.. PngChunk("IEND", "")
+end
+
+local AlphaPx = nil
+local RasterAssets = {}
+local RasterSpan = 27
+local RasterPad = 1.5
+
+function Icons:Raster(Flat, Size, Thick, Source)
+	local Reader = getcustomasset or getsynasset
+	if not (writefile and Reader and Flat) then return nil end
+	local Key = tostring(Source) .. "|" .. tostring(Size) .. "|" .. tostring(Thick) .. "|" .. tostring(self.Rev or 0)
+	local Hit = RasterAssets[Key]
+	if Hit then return Hit end
+	local K = Size / 24
+	local T = Thick or math.max(1.75, 2.05 * K)
+	local W = math.clamp(math.ceil(RasterSpan * K * 3), 24, 512)
+	local S = W / RasterSpan
+	local Rad = (T / K) * S / 2
+	local Buf = table.create(W * W, 0)
+	local Floor, Ceil, Sqrt = math.floor, math.ceil, math.sqrt
+	local function Stamp(X1, Y1, X2, Y2, R)
+		local MinX = math.max(0, Floor(math.min(X1, X2) - R - 1))
+		local MaxX = math.min(W - 1, Ceil(math.max(X1, X2) + R + 1))
+		local MinY = math.max(0, Floor(math.min(Y1, Y2) - R - 1))
+		local MaxY = math.min(W - 1, Ceil(math.max(Y1, Y2) + R + 1))
+		local Dx, Dy = X2 - X1, Y2 - Y1
+		local L2 = Dx * Dx + Dy * Dy
+		for Py = MinY, MaxY do
+			local Cy = Py + 0.5
+			local Base = Py * W + 1
+			for Px = MinX, MaxX do
+				local Cx = Px + 0.5
+				local U = 0
+				if L2 > 0 then
+					U = ((Cx - X1) * Dx + (Cy - Y1) * Dy) / L2
+					if U < 0 then U = 0 elseif U > 1 then U = 1 end
+				end
+				local Ex, Ey = Cx - (X1 + Dx * U), Cy - (Y1 + Dy * U)
+				local Cov = R + 0.5 - Sqrt(Ex * Ex + Ey * Ey)
+				if Cov > 0 then
+					if Cov > 1 then Cov = 1 end
+					local I = Base + Px
+					if Cov > Buf[I] then Buf[I] = Cov end
+				end
+			end
+		end
+	end
+	local function Map(V) return (V + RasterPad) * S end
+	for _, Sub in ipairs(Flat.subs) do
+		local P = Sub.pts
+		local N = #P / 2
+		if N == 1 then
+			Stamp(Map(P[1]), Map(P[2]), Map(P[1]), Map(P[2]), Rad)
+		else
+			for I = 1, N - 1 do
+				Stamp(Map(P[I * 2 - 1]), Map(P[I * 2]), Map(P[I * 2 + 1]), Map(P[I * 2 + 2]), Rad)
+			end
+			if Sub.closed and N > 2 then
+				Stamp(Map(P[N * 2 - 1]), Map(P[N * 2]), Map(P[1]), Map(P[2]), Rad)
+			end
+		end
+	end
+	for _, Dt in ipairs(Flat.dots) do
+		local R = math.max(Dt[3], T / K / 2) * S
+		Stamp(Map(Dt[1]), Map(Dt[2]), Map(Dt[1]), Map(Dt[2]), R)
+	end
+	if not AlphaPx then
+		AlphaPx = {}
+		for A = 0, 255 do AlphaPx[A] = string.char(255, 255, 255, A) end
+	end
+	local Rows = {}
+	for Y = 0, W - 1 do
+		local Row = table.create(W + 1)
+		Row[1] = "\0"
+		local Base = Y * W + 1
+		for X = 0, W - 1 do
+			Row[X + 2] = AlphaPx[Floor(Buf[Base + X] * 255 + 0.5)]
+		end
+		Rows[Y + 1] = table.concat(Row)
+	end
+	local Png = EncodePng(W, W, Rows)
+	local Ok, Asset = pcall(function()
+		if makefolder and isfolder then
+			if not isfolder("Rexxzy") then makefolder("Rexxzy") end
+			if not isfolder(ImageFolder) then makefolder(ImageFolder) end
+		end
+		local Path = ImageFolder .. "/ico_" .. HashHex(Key) .. ".png"
+		writefile(Path, Png)
+		return Reader(Path)
+	end)
+	if Ok and type(Asset) == "string" and Asset ~= "" then
+		RasterAssets[Key] = Asset
+		return Asset
+	end
+	return nil
+end
+
+local function ResolveImage(Url)
+	if ImageCache[Url] then return ImageCache[Url] end
+	if not (writefile and isfile and readfile) then return nil end
+	local Hash = HashHex(Url)
+	if makefolder and isfolder then
+		pcall(function()
+			if not isfolder("Rexxzy") then makefolder("Rexxzy") end
+			if not isfolder(ImageFolder) then makefolder(ImageFolder) end
+		end)
+	end
+	for _, Ext in ipairs({ "png", "jpg", "webp", "bmp" }) do
+		local P = ImageFolder .. "/" .. Hash .. "." .. Ext
+		local Ok, Has = pcall(isfile, P)
+		if Ok and Has then
+			local Id = CacheAsset(P)
+			if Id then ImageCache[Url] = Id return Id end
+		end
+	end
+	local Target = NormalizeUrl(Url)
+	local Body
+	for _ = 1, 3 do
+		Body = HttpFetch(Target)
+		if not Body then return nil end
+		local Kind = ImageKind(Body)
+		if Kind then
+			if Kind == "gif" then return nil end
+			local P = ImageFolder .. "/" .. Hash .. "." .. Kind
+			if not pcall(writefile, P, Body) then return nil end
+			local Id = CacheAsset(P)
+			if Id then ImageCache[Url] = Id end
+			return Id
+		end
+		local Next = ExtractPageImage(Body, Target)
+		if not Next or Next == Target then return nil end
+		Target = NormalizeUrl(Next)
+	end
+	return nil
+end
+
+local function IsDirectAsset(S)
+	return string.sub(S, 1, 13) == "rbxassetid://" or string.sub(S, 1, 12) == "rbxasset://"
+end
+
+function Custom:SetImage(Label, Source, Opts)
+	Opts = Opts or {}
+	if not Label then return false end
+	if Source == nil or Source == "" or Source == false then return false end
+	if type(Source) == "number" then Source = "rbxassetid://" .. tostring(math.floor(Source)) end
+	Source = tostring(Source)
+	if string.match(Source, "^%d+$") then Source = "rbxassetid://" .. Source end
+	if IsDirectAsset(Source) or string.sub(Source, 1, 17) == "rbxthumb://type=" or string.sub(Source, 1, 6) == "rbxgam" then
+		pcall(function() Label.Image = Source end)
+		if Opts.OnLoad then pcall(Opts.OnLoad, Source) end
+		return true
+	end
+	if string.sub(Source, 1, 4) ~= "http" then
+		local Ok = pcall(function() Label.Image = Source end)
+		return Ok
+	end
+	if ImageCache[Source] then
+		pcall(function() Label.Image = ImageCache[Source] end)
+		if Opts.OnLoad then pcall(Opts.OnLoad, ImageCache[Source]) end
+		return true
+	end
+	local Ticket = (ImageSession[Label] or 0) + 1
+	ImageSession[Label] = Ticket
+	local Waiters = ImagePending[Source]
+	local function Deliver(Id)
+		if ImageSession[Label] ~= Ticket then return end
+		if Id and Label.Parent then
+			pcall(function() Label.Image = Id end)
+			if Opts.OnLoad then pcall(Opts.OnLoad, Id) end
+		elseif Opts.OnFail then
+			pcall(Opts.OnFail, Source)
+		end
+	end
+	if Waiters then
+		table.insert(Waiters, Deliver)
+		return true
+	end
+	ImagePending[Source] = { Deliver }
+	task.spawn(function()
+		local Ok, Id = pcall(ResolveImage, Source)
+		if not Ok then Id = nil end
+		local List = ImagePending[Source] or {}
+		ImagePending[Source] = nil
+		for _, Fn in ipairs(List) do pcall(Fn, Id) end
+	end)
+	return true
+end
+
+function Custom:ClearImageCache()
+	ImageCache = {}
+	if listfiles and delfile then
+		pcall(function()
+			for _, P in ipairs(listfiles(ImageFolder)) do pcall(delfile, P) end
+		end)
+	end
+end
+
+function Custom:MakeIcon(Parent, Source, Props)
+	if Source == nil or Source == "" or Source == false then return nil end
+	Props = Props or {}
+	if type(Source) == "string" then Source = RexxzyLogos[Source] or Source end
+	local Size = 16
+	if typeof(Props.Size) == "UDim2" then Size = Props.Size.X.Offset > 0 and Props.Size.X.Offset or 16 end
+	local Color = Props.Color or Theme.Sub
+	local Thick = Props.Thickness
+	local Flat
+	local IsName = false
+	if type(Source) == "string" then
+		if string.sub(Source, 1, 4) == "svg:" then
+			local Text = string.sub(Source, 5)
+			local Data = string.find(Text, "<", 1, true) and Icons:FromSvgText(Text) or Text
+			if Data and Data ~= "" then Flat = Icons:Compile(Data) end
+		elseif string.find(Source, "<svg", 1, true) then
+			local Data = Icons:FromSvgText(Source)
+			if Data then Flat = Icons:Compile(Data) end
+		elseif string.sub(Source, 1, 4) ~= "http" and not string.find(Source, "://", 1, true) and not string.match(Source, "^%d+$") then
+			Flat = Icons:Get(Source)
+			IsName = true
+		end
+	end
+	if IsName and not Flat then return nil end
+	local Holder = Instance.new("Frame")
+	Holder.BackgroundTransparency = 1
+	Holder.BorderSizePixel = 0
+	Holder.Name = Props.Name or "Icon"
+	Holder.Size = UDim2.new(0, Size, 0, Size)
+	for K, V in pairs(Props) do
+		if K ~= "Color" and K ~= "Thickness" and K ~= "Size" and K ~= "Tint" then pcall(function() Holder[K] = V end) end
+	end
+	local Obj = { Instance = Holder, Kind = "svg" }
+	local RasterOk, RasterAsset = false, nil
+	if Flat and type(Source) == "string" then
+		RasterOk, RasterAsset = pcall(function() return Icons:Raster(Flat, Size, Thick, Source) end)
+	end
+	if Flat and RasterOk and RasterAsset then
+		local Img = Instance.new("ImageLabel")
+		Img.BackgroundTransparency = 1
+		Img.BorderSizePixel = 0
+		Img.Image = RasterAsset
+		Img.ImageColor3 = Color
+		Img.ScaleType = Enum.ScaleType.Stretch
+		Img.Size = UDim2.new(27 / 24, 0, 27 / 24, 0)
+		Img.Position = UDim2.new(-1.5 / 24, 0, -1.5 / 24, 0)
+		Img.Name = "Vector"
+		Img.Parent = Holder
+		function Obj.SetColor(C, Animate)
+			if Animate then Custom:Tween(Img, 0.15, { ImageColor3 = C }) else Img.ImageColor3 = C end
+		end
+		function Obj.SetTransparency(T) Img.ImageTransparency = T end
+	elseif Flat then
+		local Items = Icons:Draw(Holder, Flat, Size, Color, Thick)
+		local Driver = Instance.new("Frame")
+		Driver.Visible = false
+		Driver.BackgroundColor3 = Color
+		Driver.Size = UDim2.new(0, 0, 0, 0)
+		Driver.Name = "Driver"
+		Driver.Parent = Holder
+		Driver:GetPropertyChangedSignal("BackgroundColor3"):Connect(function()
+			local C = Driver.BackgroundColor3
+			for _, F in ipairs(Items) do F.BackgroundColor3 = C end
+		end)
+		function Obj.SetColor(C, Animate)
+			if Animate then Custom:Tween(Driver, 0.15, { BackgroundColor3 = C }) else Driver.BackgroundColor3 = C end
+		end
+		function Obj.SetTransparency(T)
+			for _, F in ipairs(Items) do F.BackgroundTransparency = T end
+		end
+	else
+		Obj.Kind = "image"
+		local Img = Instance.new("ImageLabel")
+		Img.BackgroundTransparency = 1
+		Img.BorderSizePixel = 0
+		Img.Size = UDim2.new(1, 0, 1, 0)
+		Img.ScaleType = Enum.ScaleType.Fit
+		Img.Name = "Img"
+		Img.Parent = Holder
+		Custom:SetImage(Img, Source, { OnFail = Props.OnFail })
+		Obj.Image = Img
+		function Obj.SetColor(C, Animate)
+			if Props.Tint then Img.ImageColor3 = C end
+		end
+		function Obj.SetTransparency(T) Img.ImageTransparency = T end
+	end
+	Holder.Parent = Parent
+	function Obj.Destroy() if Holder then Holder:Destroy() end end
+	return Obj
+end
+
+function Custom:Graphic(Parent, Source, Props)
+	local Obj = Custom:MakeIcon(Parent, Source, Props)
+	return Obj
+end
+
+local Rexxzy_Library = {}
+Rexxzy_Library.Unloaded = false
+Rexxzy_Library.Logos = RexxzyLogos
+
+function Rexxzy_Library:GetLogo(Name)
+    if type(Name) ~= "string" then return nil end
+    return RexxzyLogos[Name] or RexxzyLogos[string.lower(Name)] or RexxzyLogos[string.upper(Name)]
+end
+
+local NotifGui, NotifContainer, NotifCounter, NotifListLayout = nil, nil, 0, nil
+local NOTIF_DEFAULT_WIDTH = 320
+local ActiveNotificationRecords = {}
+
+local function UpdateNotificationLayout()
+	if not (NotifGui and NotifGui.Parent and NotifContainer and NotifContainer.Parent) then return end
+	local Screen = NotifGui.AbsoluteSize
+	local ScreenW = Screen and Screen.X or 0
+	local IsCompact = UserInputService.TouchEnabled and ScreenW > 0 and ScreenW < 900
+	local Width = NOTIF_DEFAULT_WIDTH
+	if IsCompact then Width = math.max(180, math.min(340, ScreenW - 24)) end
+	NotifContainer.Size = UDim2.new(0, Width, 1, -68)
+	if IsCompact then
+		NotifContainer.AnchorPoint = Vector2.new(0.5, 0)
+		NotifContainer.Position = UDim2.new(0.5, 0, 0, 48)
+		if NotifListLayout then NotifListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Center end
+	else
+		NotifContainer.AnchorPoint = Vector2.new(1, 0)
+		NotifContainer.Position = UDim2.new(1, -14, 0, 50)
+		if NotifListLayout then NotifListLayout.HorizontalAlignment = Enum.HorizontalAlignment.Right end
+	end
+end
+
+local function EnsureNotifGui()
+	if NotifGui and NotifGui.Parent then
+		UpdateNotificationLayout()
+		return
+	end
+	NotifGui = Custom:Create("ScreenGui", {
+		Name = "RexxzyNotify", ZIndexBehavior = Enum.ZIndexBehavior.Sibling, ResetOnSpawn = false,
+		DisplayOrder = 1000, IgnoreGuiInset = true,
+	}, Custom:GetGuiParent())
+	NotifContainer = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(1, -14, 0, 50), Size = UDim2.new(0, NOTIF_DEFAULT_WIDTH, 1, -68),
+		Name = "NotifContainer", ClipsDescendants = false,
+	}, NotifGui)
+	local List = Custom:Create("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder, VerticalAlignment = Enum.VerticalAlignment.Top,
+		HorizontalAlignment = Enum.HorizontalAlignment.Right, Padding = UDim.new(0, 8),
+	}, NotifContainer)
+	
+	NotifListLayout = List
+	NotifGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+		task.defer(UpdateNotificationLayout)
+	end)
+	UpdateNotificationLayout()
+end
+
+function Rexxzy_Library:SetNotification(Config)
+	if type(Config) == "string" then Config = { Content = Config } end
+	Config = type(Config) == "table" and Config or {}
+	EnsureNotifGui()
+
+	local Text = tostring(Config.Content or Config[1] or "")
+	if Text == "" then Text = " " end
+	local NType = string.lower(tostring(Config.Type or "info"))
+	local TypeIcons = {
+		success = "check-circle", error = "x-circle", warning = "alert-triangle", info = "info",
+	}
+	if not TypeIcons[NType] then NType = "info" end
+	local TypeTitles = { success = "Success", error = "Error", warning = "Warning", info = "Information" }
+	local TypeColors = {
+		success = Color3.fromRGB(112, 216, 148),
+		error = Color3.fromRGB(238, 104, 104),
+		warning = Color3.fromRGB(232, 184, 103),
+		info = Theme.White,
+	}
+	local Head = tostring(Config.Title or TypeTitles[NType])
+	local IconName = Config.Icon or TypeIcons[NType]
+	local NColor = TypeColors[NType]
+	local Delay = math.clamp(tonumber(Config.Delay or Config[6]) or 3, 0.5, 30)
+	local AnimT = math.clamp(tonumber(Config.Time or Config[5]) or 0.22, 0.12, 0.6)
+
+	
+	for I = #ActiveNotificationRecords, 1, -1 do
+		local Record = ActiveNotificationRecords[I]
+		if not (Record.Slot and Record.Slot.Parent) then table.remove(ActiveNotificationRecords, I) end
+	end
+	if #ActiveNotificationRecords >= 4 then
+		local Oldest = ActiveNotificationRecords[1]
+		if Oldest and Oldest.Close then Oldest.Close() end
+	end
+
+	NotifCounter = NotifCounter + 1
+	local Closed = false
+	local BarTween = nil
+	local NF = {}
+	local Record = { Slot = nil, Close = nil }
+	local ParentWidth = NotifContainer.AbsoluteSize.X
+	if not ParentWidth or ParentWidth < 180 then ParentWidth = NOTIF_DEFAULT_WIDTH end
+	local BodyWidth = math.max(110, ParentWidth - 88)
+	local TextSize = 11
+	local TextBounds = TextService:GetTextSize(Text, TextSize, Enum.Font.GothamMedium, Vector2.new(BodyWidth, 1000))
+	local BodyHeight = math.clamp(TextBounds.Y + 2, 14, 44)
+	local CardHeight = math.max(64, 28 + BodyHeight + 14)
+	local IsCompact = UserInputService.TouchEnabled and ParentWidth < 360
+
+	local Slot = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true,
+		LayoutOrder = NotifCounter, Size = UDim2.new(1, 0, 0, CardHeight), Name = "NotifSlot",
+	}, NotifContainer)
+	Record.Slot = Slot
+
+	local StartPosition = IsCompact and UDim2.new(0, 0, 0, -18) or UDim2.new(1, ParentWidth + 18, 0, 0)
+	local ExitPosition = IsCompact and UDim2.new(0, 0, 0, -18) or UDim2.new(1, ParentWidth + 18, 0, 0)
+	local Card = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0.02, BorderSizePixel = 0,
+		Position = StartPosition, Size = UDim2.new(1, 0, 1, 0), Name = "Card", ClipsDescendants = true,
+	}, Slot)
+	Custom:Corner(Card, 10)
+	local CardStroke = Custom:Stroke(Card, Theme.White, 0.84, 1)
+
+	local IconBadge = Custom:Create("Frame", {
+		BackgroundColor3 = NColor, BackgroundTransparency = 0.87, BorderSizePixel = 0,
+		Position = UDim2.new(0, 10, 0, 11), Size = UDim2.new(0, 30, 0, 30), Name = "IconBadge",
+	}, Card)
+	Custom:Corner(IconBadge, 8)
+	Custom:MakeIcon(IconBadge, IconName, {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(0, 16, 0, 16), Color = NColor, Name = "NotifIcon",
+	})
+
+	local CloseButton = Custom:Create("TextButton", {
+		Text = "×", Font = Enum.Font.Gotham, TextSize = 18, TextColor3 = Theme.Sub,
+		AutoButtonColor = false, BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.15,
+		BorderSizePixel = 0, AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 8),
+		Size = UDim2.new(0, 20, 0, 20), Name = "CloseButton", ZIndex = 3,
+	}, Card)
+	Custom:Corner(CloseButton, 6)
+
+	Custom:Label(Card, {
+		Text = Head, TextColor3 = Theme.Text, TextSize = 11, Font = Enum.Font.GothamBold,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Position = UDim2.new(0, 50, 0, 8), Size = UDim2.new(1, -82, 0, 16), Name = "Title",
+	})
+	Custom:Label(Card, {
+		Font = Enum.Font.GothamMedium, Text = Text, TextColor3 = Theme.Sub, TextSize = TextSize,
+		TextWrapped = true, TextYAlignment = Enum.TextYAlignment.Top,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Position = UDim2.new(0, 50, 0, 27), Size = UDim2.new(1, -62, 0, BodyHeight), Name = "Label",
+	})
+
+	local BarTrack = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0, 1), BackgroundColor3 = Theme.White, BackgroundTransparency = 0.88,
+		BorderSizePixel = 0, Position = UDim2.new(0, 10, 1, -4), Size = UDim2.new(1, -20, 0, 2), Name = "BarTrack",
+	}, Card)
+	Custom:Round(BarTrack)
+	local Bar = Custom:Create("Frame", {
+		BackgroundColor3 = NColor, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), Name = "Bar",
+	}, BarTrack)
+	Custom:Round(Bar)
+
+	local function DoClose()
+		if Closed then return end
+		Closed = true
+		if BarTween then pcall(function() BarTween:Cancel() end) end
+		if Slot and Slot.Parent then
+			local Out = Custom:Tween(Card, AnimT, { Position = ExitPosition }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			if Out then pcall(function() Out.Completed:Wait() end) end
+			if Slot and Slot.Parent then
+				local Collapse = Custom:Tween(Slot, 0.14, { Size = UDim2.new(1, 0, 0, 0) })
+				if Collapse then pcall(function() Collapse.Completed:Wait() end) end
+				if Slot and Slot.Parent then Slot:Destroy() end
+			end
+		end
+		for I = #ActiveNotificationRecords, 1, -1 do
+			if ActiveNotificationRecords[I] == Record then table.remove(ActiveNotificationRecords, I) break end
+		end
+	end
+	Record.Close = function() if not Closed then task.spawn(DoClose) end end
+	function NF:Close() Record.Close() end
+	CloseButton.Activated:Connect(function() Record.Close() end)
+	CloseButton.MouseEnter:Connect(function() Custom:Tween(CloseButton, 0.12, { BackgroundTransparency = 0 }) end)
+	CloseButton.MouseLeave:Connect(function() Custom:Tween(CloseButton, 0.12, { BackgroundTransparency = 0.15 }) end)
+	CardStroke.Transparency = 0.84
+
+	table.insert(ActiveNotificationRecords, Record)
+	Custom:Tween(Card, AnimT, { Position = UDim2.new(0, 0, 0, 0) }, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+
+	-- Keep the notification timeout, but do not animate a shrinking progress bar.
+	task.delay(Delay, function()
+		if not Closed then Record.Close() end
+	end)
+	return NF
+end
+
+Rexxzy_Library.Elements = {}
+Rexxzy_Library.ConfigFolder = "Rexxzy/Configs"
+Rexxzy_Library.LegacyFolder = "Rexxzy"
+Rexxzy_Library.Loading = false
+Rexxzy_Library.Flags = setmetatable({}, {
+	__index = function(_, Key)
+		local E = Rexxzy_Library.Elements[Key]
+		if E then
+			local ok, v = pcall(E.Get)
+			if ok then return v end
+		end
+		return nil
+	end,
+})
+
+local ConfigIndex = { Items = {}, Loaded = false, Scanning = false, Waiters = {} }
+local ConfigListeners = {}
+local ConfigSettings = nil
+local OwnerCache = nil
+local AutoSaveName = nil
+local DirtyFlag, DirtyScheduled = false, false
+local SettingsDirty, IndexDirty = false, false
+
+local function FsReady()
+	return writefile ~= nil and readfile ~= nil and isfile ~= nil
+end
+
+local function EnsureFolders()
+	if not (makefolder and isfolder) then return end
+	pcall(function()
+		if not isfolder(Rexxzy_Library.LegacyFolder) then makefolder(Rexxzy_Library.LegacyFolder) end
+		if not isfolder(Rexxzy_Library.ConfigFolder) then makefolder(Rexxzy_Library.ConfigFolder) end
+	end)
+end
+
+local function GetOwner()
+	if OwnerCache then return OwnerCache end
+	local Hw = nil
+	if gethwid then
+		local ok, v = pcall(gethwid)
+		if ok and v then Hw = tostring(v) end
+	end
+	if not Hw then
+		local ok, v = pcall(function() return game:GetService("RbxAnalyticsService"):GetClientId() end)
+		if ok and v then Hw = tostring(v) end
+	end
+	Hw = Hw or "no-hwid"
+	OwnerCache = {
+		h = "h" .. Custom.HashHex("rexxzy-hw:" .. Hw),
+		u = "u" .. Custom.HashHex("rexxzy-uid:" .. tostring(Player.UserId)),
+	}
+	return OwnerCache
+end
+
+local function CleanName(Name)
+	Name = tostring(Name or "")
+	Name = string.gsub(Name, "[^%w%-_ ]", "_")
+	Name = string.gsub(Name, "^%s+", "")
+	Name = string.gsub(Name, "%s+$", "")
+	if #Name > 40 then Name = string.sub(Name, 1, 40) end
+	if Name == "" or string.sub(Name, 1, 1) == "_" then return nil end
+	return Name
+end
+
+local function ConfigPath(Name)
+	return Rexxzy_Library.ConfigFolder .. "/" .. tostring(Name) .. ".json"
+end
+
+local function ReadJson(Path)
+	local ok, Raw = pcall(readfile, Path)
+	if not ok or type(Raw) ~= "string" then return nil end
+	local ok2, Data = pcall(HttpService.JSONDecode, HttpService, Raw)
+	if not ok2 or type(Data) ~= "table" then return nil end
+	return Data
+end
+
+local function WriteJson(Path, Data)
+	local ok, Json = pcall(HttpService.JSONEncode, HttpService, Data)
+	if not ok then return false, "encode failed" end
+	local ok2, Err = pcall(writefile, Path, Json)
+	if not ok2 then return false, tostring(Err) end
+	return true
+end
+
+local function Contains(List, Value)
+	if type(List) ~= "table" then return false end
+	for _, V in ipairs(List) do if V == Value then return true end end
+	return false
+end
+
+local function AddUnique(List, Value, Max)
+	if not Contains(List, Value) then table.insert(List, Value) end
+	while #List > Max do table.remove(List, 1) end
+end
+
+local function CopyList(List)
+	local Out = {}
+	if type(List) == "table" then for _, V in ipairs(List) do table.insert(Out, V) end end
+	return Out
+end
+
+local function ItemVisible(Item)
+	if not Item then return false end
+	local O = GetOwner()
+	return Contains(Item.h, O.h) or Contains(Item.u, O.u)
+end
+
+local function FireConfigs()
+	for _, Fn in ipairs(ConfigListeners) do pcall(Fn) end
+end
+
+local function IndexPath() return Rexxzy_Library.ConfigFolder .. "/_index.json" end
+local function SettingsPath() return Rexxzy_Library.ConfigFolder .. "/_settings.json" end
+
+local function SaveIndexSoon()
+	if IndexDirty or not FsReady() then return end
+	IndexDirty = true
+	task.delay(1, function()
+		IndexDirty = false
+		EnsureFolders()
+		local Out = {}
+		for Name, It in pairs(ConfigIndex.Items) do Out[Name] = { h = It.h, u = It.u, t = It.t } end
+		WriteJson(IndexPath(), { v = 2, items = Out })
+	end)
+end
+
+local function LoadSettings()
+	if ConfigSettings then return ConfigSettings end
+	ConfigSettings = { autoload = {}, autosave = {} }
+	if FsReady() then
+		local ok, Has = pcall(isfile, SettingsPath())
+		if ok and Has then
+			local D = ReadJson(SettingsPath())
+			if D then
+				ConfigSettings.autoload = type(D.autoload) == "table" and D.autoload or {}
+				ConfigSettings.autosave = type(D.autosave) == "table" and D.autosave or {}
+			end
+		end
+	end
+	return ConfigSettings
+end
+
+local function SaveSettingsSoon()
+	if SettingsDirty or not FsReady() then return end
+	SettingsDirty = true
+	task.delay(0.6, function()
+		SettingsDirty = false
+		EnsureFolders()
+		WriteJson(SettingsPath(), ConfigSettings or { autoload = {}, autosave = {} })
+	end)
+end
+
+local function GetPointer(Map)
+	local O = GetOwner()
+	return Map[O.u] or Map[O.h]
+end
+
+local function SetPointer(Map, Name)
+	local O = GetOwner()
+	Map[O.u] = Name
+	Map[O.h] = Name
+end
+
+local function ReadHeader(Path)
+	local D = ReadJson(Path)
+	if not D then return nil end
+	if D.v == 2 then
+		return { h = CopyList(D.hwids), u = CopyList(D.uids), t = tonumber(D.saved) or 0 }
+	end
+	return { h = {}, u = {}, t = 0, legacy = true }
+end
+
+function Rexxzy_Library:GetOwner()
+	local O = GetOwner()
+	return { Hwid = O.h, Account = O.u }
+end
+
+function Rexxzy_Library:RefreshOwner()
+	OwnerCache = nil
+	FireConfigs()
+	return self:GetOwner()
+end
+
+function Rexxzy_Library:OnConfigsChanged(Fn)
+	table.insert(ConfigListeners, Fn)
+	return {
+		Disconnect = function()
+			for I, F in ipairs(ConfigListeners) do if F == Fn then table.remove(ConfigListeners, I) break end end
+		end,
+	}
+end
+
+function Rexxzy_Library:RescanConfigs(Done, Force)
+	if not FsReady() or not listfiles then
+		if Done then task.spawn(Done) end
+		return false
+	end
+	if ConfigIndex.Scanning then
+		if Done then table.insert(ConfigIndex.Waiters, Done) end
+		return true
+	end
+	ConfigIndex.Scanning = true
+	if Done then table.insert(ConfigIndex.Waiters, Done) end
+	task.spawn(function()
+		EnsureFolders()
+		if not ConfigIndex.Loaded and not Force then
+			local Has = false
+			pcall(function() Has = isfile(IndexPath()) end)
+			if Has then
+				local D = ReadJson(IndexPath())
+				if D and type(D.items) == "table" then
+					for Name, It in pairs(D.items) do
+						if type(It) == "table" then ConfigIndex.Items[Name] = { h = CopyList(It.h), u = CopyList(It.u), t = tonumber(It.t) or 0 } end
+					end
+				end
+			end
+		end
+		if Force then ConfigIndex.Items = {} end
+		local Present = {}
+		local Reads = 0
+		local ok, Files = pcall(listfiles, Rexxzy_Library.ConfigFolder)
+		if ok and type(Files) == "table" then
+			for _, Path in ipairs(Files) do
+				local Name = string.match(tostring(Path), "([^/\\]+)%.json$")
+				if Name and string.sub(Name, 1, 1) ~= "_" then
+					Present[Name] = true
+					if not ConfigIndex.Items[Name] then
+						local H = ReadHeader(ConfigPath(Name))
+						if H and not H.legacy then ConfigIndex.Items[Name] = H end
+						Reads = Reads + 1
+						if Reads % 6 == 0 then task.wait() end
+					end
+				end
+			end
+		end
+		for Name in pairs(ConfigIndex.Items) do
+			if not Present[Name] then ConfigIndex.Items[Name] = nil end
+		end
+		local Settings = LoadSettings()
+		if not Settings.legacyDone then
+			Settings.legacyDone = true
+			SaveSettingsSoon()
+			local ok2, Old = pcall(listfiles, Rexxzy_Library.LegacyFolder)
+			if ok2 and type(Old) == "table" then
+				local Moved = 0
+				for _, Path in ipairs(Old) do
+					local Name = string.match(tostring(Path), "([^/\\]+)%.json$")
+					local Clean = Name and CleanName(Name)
+					if Clean and not ConfigIndex.Items[Clean] then
+						local D = ReadJson(tostring(Path))
+						if D and D.v == nil then
+							local O = GetOwner()
+							local Doc = { v = 2, name = Clean, saved = os.time(), hwids = { O.h }, uids = { O.u }, data = D }
+							if WriteJson(ConfigPath(Clean), Doc) then ConfigIndex.Items[Clean] = { h = Doc.hwids, u = Doc.uids, t = Doc.saved } end
+							Moved = Moved + 1
+							if Moved % 4 == 0 then task.wait() end
+						end
+					end
+				end
+			end
+		end
+		ConfigIndex.Loaded = true
+		ConfigIndex.Scanning = false
+		SaveIndexSoon()
+		local Waiters = ConfigIndex.Waiters
+		ConfigIndex.Waiters = {}
+		FireConfigs()
+		for _, W in ipairs(Waiters) do pcall(W) end
+	end)
+	return true
+end
+
+function Rexxzy_Library:GetConfigs()
+	if not ConfigIndex.Loaded and not ConfigIndex.Scanning then self:RescanConfigs() end
+	local Out = {}
+	for Name, It in pairs(ConfigIndex.Items) do
+		if ItemVisible(It) then table.insert(Out, Name) end
+	end
+	table.sort(Out, function(A, B) return string.lower(A) < string.lower(B) end)
+	return Out
+end
+
+function Rexxzy_Library:SaveConfig(Name, Silent)
+	if not FsReady() then return false, "writefile is not supported" end
+	local Clean = CleanName(Name)
+	if not Clean then return false, "invalid config name" end
+	EnsureFolders()
+	local O = GetOwner()
+	local Path = ConfigPath(Clean)
+	local Hw, Uid = {}, {}
+	local Has = false
+	pcall(function() Has = isfile(Path) end)
+	if Has then
+		local Old = ReadJson(Path)
+		if Old and Old.v == 2 then
+			local Item = { h = CopyList(Old.hwids), u = CopyList(Old.uids) }
+			if not ItemVisible(Item) then return false, "config belongs to another owner" end
+			Hw, Uid = Item.h, Item.u
+		end
+	end
+	AddUnique(Hw, O.h, 8)
+	AddUnique(Uid, O.u, 8)
+	local Data = {}
+	for Flag, E in pairs(self.Elements) do
+		local ok, v = pcall(E.Get)
+		if ok and v ~= nil then
+			local ok2, Enc = pcall(E.Encode, v)
+			if ok2 and Enc ~= nil then Data[Flag] = Enc end
+		end
+	end
+	local Doc = { v = 2, name = Clean, saved = os.time(), hwids = Hw, uids = Uid, data = Data }
+	local Saved, Err = WriteJson(Path, Doc)
+	if not Saved then return false, Err end
+	ConfigIndex.Items[Clean] = { h = Hw, u = Uid, t = Doc.saved }
+	SaveIndexSoon()
+	if not Silent then FireConfigs() end
+	return true, Clean
+end
+
+function Rexxzy_Library:LoadConfig(Name, Done)
+	if not FsReady() then
+		if Done then task.spawn(Done, false, "readfile is not supported") end
+		return false, "readfile is not supported"
+	end
+	local Clean = CleanName(Name)
+	if not Clean then
+		if Done then task.spawn(Done, false, "invalid config name") end
+		return false, "invalid config name"
+	end
+	local Path = ConfigPath(Clean)
+	local Has = false
+	pcall(function() Has = isfile(Path) end)
+	if not Has then
+		if Done then task.spawn(Done, false, "config not found") end
+		return false, "config not found"
+	end
+	local Doc = ReadJson(Path)
+	if not Doc then
+		if Done then task.spawn(Done, false, "decode failed") end
+		return false, "decode failed"
+	end
+	local Data = Doc
+	if Doc.v == 2 then
+		if not ItemVisible({ h = Doc.hwids, u = Doc.uids }) then
+			if Done then task.spawn(Done, false, "no access to this config") end
+			return false, "no access to this config"
+		end
+		Data = type(Doc.data) == "table" and Doc.data or {}
+	end
+	local Library = self
+	Library.Loading = true
+	task.spawn(function()
+		local Count = 0
+		for Flag, Value in pairs(Data) do
+			local E = Library.Elements[Flag]
+			if E then
+				pcall(function() E.Set(E.Decode(Value)) end)
+				Count = Count + 1
+				if Count % 6 == 0 then task.wait() end
+			end
+		end
+		task.wait()
+		Library.Loading = false
+		Library.LastConfig = Clean
+		if Done then pcall(Done, true, Clean) end
+	end)
+	return true, Clean
+end
+
+function Rexxzy_Library:DeleteConfig(Name)
+	if not (delfile and isfile) then return false end
+	local Clean = CleanName(Name)
+	if not Clean then return false end
+	local Item = ConfigIndex.Items[Clean]
+	if Item and not ItemVisible(Item) then return false end
+	local Path = ConfigPath(Clean)
+	local Has = false
+	pcall(function() Has = isfile(Path) end)
+	if not Has then
+		ConfigIndex.Items[Clean] = nil
+		FireConfigs()
+		return false
+	end
+	if not Item then
+		local H = ReadHeader(Path)
+		if H and not ItemVisible(H) then return false end
+	end
+	local ok = pcall(delfile, Path)
+	if not ok then return false end
+	ConfigIndex.Items[Clean] = nil
+	local S = LoadSettings()
+	if GetPointer(S.autoload) == Clean then SetPointer(S.autoload, nil) end
+	if GetPointer(S.autosave) == Clean then SetPointer(S.autosave, nil) AutoSaveName = nil end
+	SaveSettingsSoon()
+	SaveIndexSoon()
+	FireConfigs()
+	return true
+end
+
+function Rexxzy_Library:SetAutoLoad(Name)
+	local S = LoadSettings()
+	SetPointer(S.autoload, Name and CleanName(Name) or nil)
+	SaveSettingsSoon()
+end
+
+function Rexxzy_Library:GetAutoLoad()
+	return GetPointer(LoadSettings().autoload)
+end
+
+function Rexxzy_Library:LoadAutoConfig(Done)
+	local Name = self:GetAutoLoad()
+	if not Name then
+		if Done then task.spawn(Done, false, "no auto-load config") end
+		return false
+	end
+	self:RescanConfigs(function()
+		local Item = ConfigIndex.Items[Name]
+		if Item and ItemVisible(Item) then
+			self:LoadConfig(Name, Done)
+		elseif Done then
+			Done(false, "config not available")
+		end
+	end)
+	return true
+end
+
+function Rexxzy_Library:SetAutoSave(Name)
+	local S = LoadSettings()
+	local Clean = Name and CleanName(Name) or nil
+	SetPointer(S.autosave, Clean)
+	AutoSaveName = Clean
+	SaveSettingsSoon()
+end
+
+function Rexxzy_Library:GetAutoSave()
+	AutoSaveName = GetPointer(LoadSettings().autosave)
+	return AutoSaveName
+end
+
+function Rexxzy_Library:MarkDirty()
+	if self.Loading or not self.Armed then return end
+	if not AutoSaveName then return end
+	DirtyFlag = true
+	if DirtyScheduled then return end
+	DirtyScheduled = true
+	task.delay(1.5, function()
+		DirtyScheduled = false
+		if DirtyFlag and AutoSaveName and not self.Loading then
+			DirtyFlag = false
+			self:SaveConfig(AutoSaveName, true)
+		end
+	end)
+end
+
+function Rexxzy_Library:ClearImageCache()
+	Custom:ClearImageCache()
+end
+
+function Rexxzy_Library:Notify(Config)
+	return self:SetNotification(Config)
+end
+
+function Rexxzy_Library:NotifySuccess(Content, Title)
+	return self:SetNotification({ Type = "success", Title = Title or "Success", Content = Content })
+end
+function Rexxzy_Library:NotifyError(Content, Title)
+	return self:SetNotification({ Type = "error", Title = Title or "Error", Content = Content })
+end
+function Rexxzy_Library:NotifyWarning(Content, Title)
+	return self:SetNotification({ Type = "warning", Title = Title or "Warning", Content = Content })
+end
+function Rexxzy_Library:NotifyInfo(Content, Title)
+	return self:SetNotification({ Type = "info", Title = Title or "Information", Content = Content })
+end
+function Rexxzy_Library:ClearNotifications()
+	local Count = #ActiveNotificationRecords
+	for Index = #ActiveNotificationRecords, 1, -1 do
+		local Record = ActiveNotificationRecords[Index]
+		if Record and Record.Close then Record.Close() end
+	end
+	return Count
+end
+
+function Rexxzy_Library:RegisterIcon(Name, Source) return Icons:Register(Name, Source) end
+function Rexxzy_Library:HasIcon(Name) return Icons:Resolve(Name) ~= nil end
+function Rexxzy_Library:GetIcons() return Icons:List() end
+function Rexxzy_Library:SetLucideFallback(Enabled)
+	Icons.RemoteEnabled = Enabled ~= false
+	return Icons.RemoteEnabled
+end
+function Rexxzy_Library:IsLucideFallbackEnabled() return Icons.RemoteEnabled ~= false end
+
+task.defer(function()
+	if FsReady() then
+		Rexxzy_Library:GetAutoSave()
+		Rexxzy_Library:RescanConfigs()
+	end
+end)
+
+function Rexxzy_Library:CreateWindow(Config)
+	Config = type(Config) == "table" and Config or {}
+	local Title = Config[1] or Config.Title or ""
+	local Desc = Config[2] or Config.Description or ""
+	local _CfgTabWidth = Config[3] or Config["Tab Width"] or 164
+	local IsMobileCtx = UserInputService.TouchEnabled
+	
+	local MobileLayout = IsMobileCtx and Config.MobileResponsive ~= false
+	local TabWidth = IsMobileCtx and math.min(math.max(_CfgTabWidth, 108), 126) or math.min(math.max(_CfgTabWidth, 130), 150)
+	local SizeUi = Config[4] or Config.SizeUi or UDim2.fromOffset(900, 560)
+	local Keybind = Config[5] or Config.Keybind or Enum.KeyCode.RightControl
+	local Icon = Config[6] or Config.Icon or "hub"
+	local Funcs = {}
+	local SearchRegistry = {}
+	local Conns, Loops = {}, {}
+	local Destroyed = false
+	local Opened = true
+
+	local function Track(c) table.insert(Conns, c) return c end
+
+	
+	
+	
+	local DeveloperTagEnabled = true
+	local DeveloperTagText = REXXZY_DEVELOPER_TAG_TEXT
+	local DeveloperTagColor = Color3.fromRGB(245, 245, 245)
+	local DeveloperTagDistance = REXXZY_DEVELOPER_TAG_MAX_DISTANCE
+	local DeveloperIdLookup = {}
+	local DeveloperPlayerConnections = {}
+
+	for UserId, Enabled in pairs(REXXZY_DEVELOPER_USER_IDS) do
+		local Id = tonumber(UserId)
+		if Enabled == true and Id and Id > 0 then
+			DeveloperIdLookup[tostring(math.floor(Id))] = true
+		end
+	end
+
+	local function RemoveDeveloperTag(Character)
+		if not Character then return end
+		local Existing = Character:FindFirstChild("RexxzyDeveloperTag")
+		if Existing then Existing:Destroy() end
+	end
+
+	local function AttachDeveloperTag(TargetPlayer, Character)
+		if not DeveloperTagEnabled or not TargetPlayer or not Character then return end
+		if not DeveloperIdLookup[tostring(TargetPlayer.UserId)] then
+			RemoveDeveloperTag(Character)
+			return
+		end
+		if Character:FindFirstChild("RexxzyDeveloperTag") then return end
+		local Head = Character:FindFirstChild("Head") or Character:WaitForChild("Head", 10)
+		if not Head or not Head:IsA("BasePart") then return end
+		if TargetPlayer.Character ~= Character or not DeveloperTagEnabled then return end
+		local Billboard = Custom:Create("BillboardGui", {
+			Name = "RexxzyDeveloperTag", Adornee = Head, AlwaysOnTop = true,
+			LightInfluence = 0, MaxDistance = DeveloperTagDistance,
+			Size = UDim2.fromOffset(154, 29), StudsOffset = Vector3.new(0, 2.85, 0),
+		}, Character)
+		local Badge = Custom:Create("Frame", {
+			Name = "Badge", BackgroundColor3 = Color3.fromRGB(12, 12, 12),
+			BackgroundTransparency = 0.08, BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 1, 0),
+		}, Billboard)
+		Custom:Corner(Badge, 8)
+		Custom:Stroke(Badge, DeveloperTagColor, 0.28, 1)
+		Custom:Create("TextLabel", {
+			Name = "DeveloperTitle", BackgroundTransparency = 1, BorderSizePixel = 0,
+			Font = Enum.Font.GothamBold, Text = DeveloperTagText, TextColor3 = DeveloperTagColor,
+			TextSize = 12, TextScaled = false, TextWrapped = false,
+			TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+			Size = UDim2.new(1, -10, 1, 0), Position = UDim2.new(0, 5, 0, 0),
+		}, Badge)
+	end
+
+	local function WatchDeveloperPlayer(TargetPlayer)
+		if DeveloperPlayerConnections[TargetPlayer] then return end
+		local Added = TargetPlayer.CharacterAdded:Connect(function(Character)
+			task.spawn(AttachDeveloperTag, TargetPlayer, Character)
+		end)
+		local Removing = TargetPlayer.CharacterRemoving:Connect(function(Character)
+			RemoveDeveloperTag(Character)
+		end)
+		DeveloperPlayerConnections[TargetPlayer] = { Added, Removing }
+		if TargetPlayer.Character then task.spawn(AttachDeveloperTag, TargetPlayer, TargetPlayer.Character) end
+	end
+
+	local function RefreshDeveloperTags()
+		for _, TargetPlayer in ipairs(Players:GetPlayers()) do
+			WatchDeveloperPlayer(TargetPlayer)
+			if DeveloperTagEnabled and DeveloperIdLookup[tostring(TargetPlayer.UserId)] then
+				if TargetPlayer.Character then task.spawn(AttachDeveloperTag, TargetPlayer, TargetPlayer.Character) end
+			elseif TargetPlayer.Character then
+				RemoveDeveloperTag(TargetPlayer.Character)
+			end
+		end
+	end
+
+	local function ClearDeveloperTags()
+		for TargetPlayer, Connections in pairs(DeveloperPlayerConnections) do
+			for _, Connection in ipairs(Connections) do pcall(function() Connection:Disconnect() end) end
+			if TargetPlayer.Character then RemoveDeveloperTag(TargetPlayer.Character) end
+		end
+		DeveloperPlayerConnections = {}
+	end
+
+	Track(Players.PlayerAdded:Connect(WatchDeveloperPlayer))
+	Track(Players.PlayerRemoving:Connect(function(TargetPlayer)
+		if TargetPlayer.Character then RemoveDeveloperTag(TargetPlayer.Character) end
+		local Connections = DeveloperPlayerConnections[TargetPlayer]
+		if Connections then
+			for _, Connection in ipairs(Connections) do pcall(function() Connection:Disconnect() end) end
+			DeveloperPlayerConnections[TargetPlayer] = nil
+		end
+	end))
+	RefreshDeveloperTags()
+
+	-- Continuous decorative loops are disabled in the static layout.
+	local function Loop(inst, props, time, reverses, style)
+		if inst and type(props) == "table" then
+			for Property, Value in pairs(props) do pcall(function() inst[Property] = Value end) end
+		end
+		return nil
+	end
+
+	local RexxzyGui = Custom:Create("ScreenGui", {
+		Name = "Rexxzy", ZIndexBehavior = Enum.ZIndexBehavior.Sibling, ResetOnSpawn = false,
+		IgnoreGuiInset = true, DisplayOrder = 100,
+	}, Custom:GetGuiParent())
+
+	local Base = tonumber(Config.Scale or Config.UIScale) or 0.84
+	do
+		local Screen = RexxzyGui.AbsoluteSize
+		if MobileLayout and Screen and Screen.X > 0 and Screen.Y > 0 then
+			
+			
+			local MobileW = math.floor(math.min(Screen.X * 0.92, 650))
+			local MobileH = math.floor(math.min(Screen.Y * 0.86, 780))
+			SizeUi = UDim2.fromOffset(math.max(1, MobileW), math.max(1, MobileH))
+			Base = 0.82
+		else
+			if Screen and Screen.X > 0 and Screen.Y > 0 then
+				local FitX = IsMobileCtx and 0.98 or 0.94
+				local FitY = IsMobileCtx and 0.94 or 0.90
+				if SizeUi.X.Offset > 0 then Base = math.min(Base, (Screen.X * FitX) / SizeUi.X.Offset) end
+				if SizeUi.Y.Offset > 0 then Base = math.min(Base, (Screen.Y * FitY) / SizeUi.Y.Offset) end
+			end
+			Base = math.clamp(Base, 0.38, 1.5)
+		end
+	end
+
+	local DropShadowHolder = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(0.5, 0, 0.5, 0), Size = SizeUi, Name = "DropShadowHolder",
+	}, RexxzyGui)
+	local WindowScale = Custom:Create("UIScale", { Scale = Base }, DropShadowHolder)
+
+	local Main = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+		ClipsDescendants = true, Size = UDim2.new(1, 0, 1, 0), ZIndex = 1, Name = "Main",
+	}, DropShadowHolder)
+	Custom:Corner(Main, 12)
+	-- Flat black application canvas; no extra wallpaper or gradient layer.
+	local MainStroke = Custom:Stroke(Main, Theme.Border, 0.58, 1.1)
+	
+
+	local function RefreshMobileLayout()
+		if not MobileLayout or Destroyed or not DropShadowHolder.Parent then return end
+		local Screen = RexxzyGui.AbsoluteSize
+		local Scale = math.max(tonumber(Base) or 1, 0.1)
+		if not Screen or Screen.X <= 0 or Screen.Y <= 0 then return end
+		local Width = math.floor(math.min(650, (Screen.X * 0.92) / Scale))
+		local Height = math.floor(math.min(780, (Screen.Y * 0.86) / Scale))
+		DropShadowHolder.Size = UDim2.fromOffset(math.max(1, Width), math.max(1, Height))
+	end
+
+	if MobileLayout then
+		Track(RexxzyGui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+			task.defer(RefreshMobileLayout)
+		end))
+		task.defer(RefreshMobileLayout)
+	end
+
+	local BgImage = Custom:Create("ImageLabel", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), ZIndex = 0,
+		ScaleType = Enum.ScaleType.Crop, ImageTransparency = 0.35, Visible = false, Name = "Background",
+	}, Main)
+	Custom:Corner(BgImage, 12)
+	local BgDim = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Black, BackgroundTransparency = 0.45, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0),
+		ZIndex = 0, Visible = false, Name = "BackgroundDim",
+	}, Main)
+	Custom:Corner(BgDim, 12)
+	local BgImageT = tonumber(Config.BackgroundTransparency) or 0.35
+	local BgDimT = tonumber(Config.BackgroundDim) or 0.45
+	local DefaultBackground
+	local function ApplyBackground(Src, Opts)
+		Opts = Opts or {}
+		if Src == nil or Src == "" or Src == false then
+			BgImage.Visible = false
+			BgDim.Visible = false
+			BgImage.Image = ""
+			return false
+		end
+		local Fit = string.lower(tostring(Opts.Fit or Config.BackgroundFit or "crop"))
+		BgImage.ScaleType = Fit == "fit" and Enum.ScaleType.Fit or (Fit == "stretch" and Enum.ScaleType.Stretch or Enum.ScaleType.Crop)
+		if Opts.Transparency ~= nil then BgImageT = tonumber(Opts.Transparency) or BgImageT end
+		if Opts.Dim ~= nil then BgDimT = tonumber(Opts.Dim) or BgDimT end
+		BgImage.ImageTransparency = 1
+		BgImage.Visible = true
+		BgDim.BackgroundTransparency = BgDimT
+		BgDim.Visible = true
+		return Custom:SetImage(BgImage, Src, {
+			OnLoad = function() Custom:Tween(BgImage, 0.4, { ImageTransparency = BgImageT }) end,
+			OnFail = function() BgImage.Visible = false BgDim.Visible = false end,
+		})
+	end
+
+	local Top = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 50), Name = "Top",
+	}, Main)
+	-- Invisible hit area for dragging: no visible handle, but the full free
+	-- portion of the topbar remains draggable on mouse and touch.
+	local DragHandle = Custom:Create("TextButton", {
+		Name = "DragHandle", Text = "", AutoButtonColor = false, Selectable = false,
+		Active = true, BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(1, 0, 1, 0),
+	}, Top)
+
+	Custom:Create("Frame", {
+		BackgroundColor3 = Theme.White, BackgroundTransparency = 0.82, BorderSizePixel = 0,
+		Position = UDim2.new(0, 0, 0, 50), Size = UDim2.new(1, 0, 0, 1), Name = "DecideFrame",
+	}, Main)
+	-- No glow line: a single quiet divider keeps the header clean.
+
+	local TitleHolder = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true,
+		Position = UDim2.new(0, 52, 0, 0), Size = UDim2.new(1, -166, 1, 0), Name = "TitleHolder",
+	}, Top)
+	Custom:Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder,
+		VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 7),
+	}, TitleHolder)
+	Custom:Create("UIPadding", { PaddingLeft = UDim.new(0, 9) }, TitleHolder)
+
+	-- The application mark sits at the left edge of the topbar.
+
+	local TextLabel = Custom:Label(TitleHolder, {
+		Text = Title, TextColor3 = Theme.White, TextSize = 14, Font = Enum.Font.GothamBold, LayoutOrder = 1,
+		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 0, 24), Name = "Title",
+	})
+	Custom:AddGradient(TextLabel, 0)
+
+	local Separator = Custom:Label(TitleHolder, {
+		Text = "|", TextColor3 = Theme.Sub, TextSize = 11, LayoutOrder = 2,
+		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 0, 20), Name = "Separator",
+	})
+
+	local TextLabel1 = Custom:Label(TitleHolder, {
+		Font = Enum.Font.Gotham, Text = Desc, TextColor3 = Theme.Sub, TextSize = 9, LayoutOrder = 3,
+		AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 0, 20), Name = "Description",
+	})
+
+	local CenterTitleText = tostring(Config.CenterTitle or Config.HeaderTitle or "")
+	local CenterSubtitleText = tostring(Config.CenterSubtitle or Config.HeaderSubtitle or "")
+	local HeaderCenter = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(0.5, 0, 0, 5), Size = UDim2.new(0, 280, 1, -10),
+		Visible = CenterTitleText ~= "" or CenterSubtitleText ~= "", Name = "HeaderCenter",
+	}, Top)
+	Custom:Label(HeaderCenter, {
+		Text = CenterTitleText, TextColor3 = Theme.White, TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+		Position = UDim2.new(0, 0, 0, 1), Size = UDim2.new(1, 0, 0, 25), Name = "CenterTitle",
+	})
+	Custom:Label(HeaderCenter, {
+		Font = Enum.Font.Gotham, Text = CenterSubtitleText, TextColor3 = Theme.Sub, TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+		Position = UDim2.new(0, 0, 0, 27), Size = UDim2.new(1, 0, 0, 20), Name = "CenterSubtitle",
+	})
+
+	local function SyncDescVisibility()
+		Separator.Visible = TextLabel1.Text ~= ""
+		TextLabel1.Visible = TextLabel1.Text ~= ""
+	end
+	SyncDescVisibility()
+
+	local TagHolder = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(1, -104, 0.5, 0), Size = UDim2.new(0, 0, 0, 18),
+		AutomaticSize = Enum.AutomaticSize.X, Name = "Tags",
+	}, Top)
+	Custom:Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder,
+		VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 5),
+	}, TagHolder)
+
+	local function SyncTitleWidth()
+		if HeaderCenter.Visible then
+			TitleHolder.Size = UDim2.new(0.34, -56, 1, 0)
+		else
+			TitleHolder.Size = UDim2.new(1, -(154 + TagHolder.AbsoluteSize.X), 1, 0)
+		end
+	end
+	TagHolder:GetPropertyChangedSignal("AbsoluteSize"):Connect(SyncTitleWidth)
+	SyncTitleWidth()
+
+	local TagsFuncs = {}
+	local TagList = {}
+	local MAX_TAGS = 3
+
+	function TagsFuncs:Add(Text, TagIcon)
+		if type(Text) == "table" then
+			TagIcon = Text[2] or Text.Icon
+			Text = Text[1] or Text.Text
+		end
+		if #TagList >= MAX_TAGS then return { Frame = nil, Set = function() end, SetIcon = function() end, Remove = function() end } end
+		Text = tostring(Text or "Tag")
+		local TagFrame = Custom:Create("Frame", {
+			BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+			AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 0, 17), LayoutOrder = #TagList + 1, Name = "Tag",
+		}, TagHolder)
+		Custom:Round(TagFrame)
+		Custom:Stroke(TagFrame, Theme.White, 0, 1)
+		Custom:Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder,
+			VerticalAlignment = Enum.VerticalAlignment.Center, Padding = UDim.new(0, 4),
+		}, TagFrame)
+		Custom:Create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 8) }, TagFrame)
+		local TagIconSlot = Custom:Create("Frame", {
+			BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 1, Size = UDim2.new(0, 13, 0, 13),
+			Visible = false, Name = "TagIconSlot",
+		}, TagFrame)
+		local TagLabel = Custom:Label(TagFrame, {
+			Text = Text, TextColor3 = Theme.Text, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Center,
+			AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 1, 0), LayoutOrder = 2, Name = "TagText",
+		})
+
+		local TagEntry = { Frame = TagFrame }
+		local TIF = { Frame = TagFrame }
+		table.insert(TagList, TagEntry)
+
+		function TIF:SetIcon(Src)
+			for _, Child in ipairs(TagIconSlot:GetChildren()) do Child:Destroy() end
+			if Src == nil or Src == "" or Src == false then
+				TagIconSlot.Visible = false
+				return
+			end
+			local Obj = Custom:MakeIcon(TagIconSlot, Src, { Size = UDim2.new(0, 13, 0, 13), Color = Theme.Text, Thickness = 1.6, Name = "TagIcon" })
+			TagIconSlot.Visible = Obj ~= nil
+		end
+		function TIF:Set(NewText)
+			if TagFrame.Parent then TagLabel.Text = tostring(NewText) end
+		end
+		function TIF:Remove()
+			for i, v in ipairs(TagList) do if v == TagEntry then table.remove(TagList, i) break end end
+			TagFrame:Destroy()
+			for i, v in ipairs(TagList) do v.Frame.LayoutOrder = i end
+		end
+		if TagIcon then TIF:SetIcon(TagIcon) end
+		return TIF
+	end
+
+	function TagsFuncs:AddDynamic(Label, ValueFn, RefreshInterval, TagIcon)
+		Label = Label or "" ValueFn = ValueFn or function() return "" end
+		local function CT()
+			local Ok, Value = pcall(ValueFn)
+			Value = (Ok and Value ~= nil and tostring(Value)) or "Unknown"
+			return (Label ~= "" and (Label .. ": " .. Value)) or Value
+		end
+		local TIF = TagsFuncs:Add(CT(), TagIcon)
+		if RefreshInterval and TIF.Frame then
+			task.spawn(function()
+				while TIF.Frame and TIF.Frame.Parent do
+					task.wait(RefreshInterval)
+					if not (TIF.Frame and TIF.Frame.Parent) then break end
+					TIF:Set(CT())
+				end
+			end)
+		end
+		return TIF
+	end
+
+	function TagsFuncs:AddExecutorTag(RefreshInterval, TagIcon)
+		return TagsFuncs:AddDynamic("Executor", function() return SafeGetExecutor() end, RefreshInterval, TagIcon or "cpu")
+	end
+
+	Funcs.Tags = TagsFuncs
+
+	function Funcs:SetTitle(NewTitle) TextLabel.Text = tostring(NewTitle) end
+	function Funcs:SetDescription(NewDescription)
+		TextLabel1.Text = tostring(NewDescription)
+		SyncDescVisibility()
+	end
+
+	local Close = Custom:Create("TextButton", {
+		Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0.5), BackgroundColor3 = Theme.Red,
+		BorderSizePixel = 0, ClipsDescendants = true, Position = UDim2.new(1, -6, 0.5, 0),
+		Size = UDim2.new(0, 24, 0, 24), Name = "Close",
+	}, Top)
+	Custom:Corner(Close, 6)
+	for _, Rot in ipairs({ 45, -45 }) do
+		local Bar = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+			Position = UDim2.new(0.5, 0, 0.5, 0), Rotation = Rot, Size = UDim2.new(0, 14, 0, 2), Name = "XBar",
+		}, Close)
+		Custom:Round(Bar)
+	end
+	Close.MouseEnter:Connect(function() Close.BackgroundColor3 = Theme.Selected end)
+	Close.MouseLeave:Connect(function() Close.BackgroundColor3 = Theme.Field end)
+
+	local Min = Custom:Create("TextButton", {
+		Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0.5), BackgroundColor3 = Theme.Black,
+		BackgroundTransparency = 0, BorderSizePixel = 0, ClipsDescendants = true, Position = UDim2.new(1, -36, 0.5, 0),
+		Size = UDim2.new(0, 24, 0, 24), Name = "Min",
+	}, Top)
+	Custom:Corner(Min, 6)
+	local MinStroke = Custom:Stroke(Min, Theme.White, 0.8, 1)
+	local MinBar = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+		Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 10, 0, 2), Name = "MinBar",
+	}, Min)
+	Custom:Round(MinBar)
+	Min.MouseEnter:Connect(function()
+		Custom:Tween(Min, 0.15, { BackgroundTransparency = 0 })
+		MinStroke.Transparency = 0
+	end)
+	Min.MouseLeave:Connect(function()
+		Custom:Tween(Min, 0.2, { BackgroundTransparency = 0 })
+		MinStroke.Transparency = 0
+	end)
+
+	if Config.Tags or Config[7] then
+		for _, TagText in ipairs(Config.Tags or Config[7]) do TagsFuncs:Add(TagText) end
+	end
+
+	-- Sidebar starts directly below the topbar and ends above the shared footer.
+	-- Category labels are inserted by AddTabDivider; CORE/TOOLS are not hard-coded tabs.
+	local SidebarTop = 54
+	local SidebarBottom = 48
+	local Side = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+		ClipsDescendants = true, Position = UDim2.new(0, 0, 0, SidebarTop),
+		Size = UDim2.new(0, TabWidth, 1, -(SidebarTop + SidebarBottom)), Name = "LayersTab",
+	}, Main)
+	local SidebarBrand = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(0, 10, 0, 0), Size = UDim2.new(0, 42, 1, 0),
+		Name = "SidebarBrand",
+	}, Top)
+	local SidebarLogoTile = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(0, 34, 0, 34),
+		BackgroundColor3 = Theme.Field, BackgroundTransparency = 0, BorderSizePixel = 0,
+		ClipsDescendants = true, Name = "SidebarLogoTile",
+	}, SidebarBrand)
+	-- Keep the header/sidebar logo tile square with modest rounded corners.
+	Custom:Corner(SidebarLogoTile, 9)
+	Custom:Stroke(SidebarLogoTile, Theme.Border, 0.55, 1)
+	local SidebarIconProps = {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(0, 28, 0, 28), Color = Theme.White, Name = "SidebarLogo",
+	}
+	local SidebarLogo = Custom:MakeIcon(SidebarLogoTile, Icon, SidebarIconProps)
+	if not SidebarLogo then
+		SidebarLogo = Custom:MakeIcon(SidebarLogoTile, "hexagon", SidebarIconProps)
+	end
+	if SidebarLogo and SidebarLogo.Kind == "image" then
+		SidebarLogo.Image.ScaleType = Enum.ScaleType.Fit
+	end
+	local function ApplySidebarLogo(Source)
+		if SidebarLogo then pcall(function() SidebarLogo:Destroy() end) end
+		local Props = {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+			Size = UDim2.new(0, 28, 0, 28), Color = Theme.White, Name = "SidebarLogo",
+		}
+		SidebarLogo = Custom:MakeIcon(SidebarLogoTile, Source, Props)
+		if not SidebarLogo then SidebarLogo = Custom:MakeIcon(SidebarLogoTile, "hexagon", Props) end
+		if SidebarLogo and SidebarLogo.Kind == "image" then
+			SidebarLogo.Image.ScaleType = Enum.ScaleType.Fit
+		end
+	end
+
+	Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Border, BackgroundTransparency = 0.45, BorderSizePixel = 0,
+		Position = UDim2.new(0, TabWidth, 0, SidebarTop),
+		Size = UDim2.new(0, 1, 1, -SidebarTop), Name = "SidebarDivider",
+	}, Main)
+
+	local SearchBoxContainer = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0, 1), BackgroundColor3 = Theme.Field, BackgroundTransparency = 0,
+		BorderSizePixel = 0, Position = UDim2.new(0, 8, 1, -8),
+		Size = UDim2.new(1, -16, 0, 32), Name = "SBC",
+	}, Side)
+	Custom:Corner(SearchBoxContainer, 8)
+	local SearchStroke = Custom:Stroke(SearchBoxContainer, Theme.Border, 0.7, 1)
+
+	local SearchIconObj = Custom:MakeIcon(SearchBoxContainer, "search", {
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.new(0, 15, 0, 15),
+		ZIndex = 2, Color = Theme.Sub, Name = "SI",
+	})
+
+	local SearchBox = Custom:Create("TextBox", {
+		Font = Enum.Font.GothamBold, PlaceholderText = "Search...", PlaceholderColor3 = Theme.Sub,
+		Text = "", TextColor3 = Theme.Text, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+		ClearTextOnFocus = false, BackgroundTransparency = 1, BorderSizePixel = 0,
+		ZIndex = 2, Position = UDim2.new(0, 31, 0, 0), Size = UDim2.new(1, -38, 1, 0), Name = "SearchBox",
+	}, SearchBoxContainer)
+
+	SearchBox.Focused:Connect(function()
+		if SearchIconObj then SearchIconObj.SetColor(Theme.White, true) end
+		Custom:Tween(SearchStroke, 0.14, { Transparency = 0.38, Color = Theme.White })
+	end)
+	SearchBox.FocusLost:Connect(function()
+		if SearchIconObj then SearchIconObj.SetColor(Theme.Sub, true) end
+		Custom:Tween(SearchStroke, 0.16, { Transparency = 0.7, Color = Theme.Border })
+	end)
+
+	local Layers = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true,
+		Position = UDim2.new(0, TabWidth + 1, 0, 50),
+		Size = UDim2.new(1, -(TabWidth + 1), 1, -96), Name = "Layers",
+	}, Main)
+
+	-- No decorative page-header icons: they previously left two stray paw marks.
+	local NameTab = Custom:Label(Layers, {
+		Text = "", TextColor3 = Theme.White, TextSize = 26, Font = Enum.Font.GothamBold,
+		Position = UDim2.new(0, 18, 0, 13), Size = UDim2.new(1, -36, 0, 38), Name = "NameTab",
+	})
+	Custom:AddGradient(NameTab, 0)
+	NameTab.Visible = false
+
+	local LayersReal = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true,
+		Position = UDim2.new(0, 9, 0, 0), Size = UDim2.new(1, -18, 1, 0), Name = "LayersReal",
+	}, Layers)
+
+	local ScrollTab = Custom:Create("ScrollingFrame", {
+		Active = true, BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(0, 0, 0, 0),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.Sub,
+		ScrollBarImageTransparency = 0.55, ScrollingDirection = Enum.ScrollingDirection.Y,
+		Position = UDim2.new(0, 7, 0, 7),
+		Size = UDim2.new(1, -14, 1, -49), Name = "ScrollTab",
+	}, Side)
+	Custom:Create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, ScrollTab)
+	Custom:Create("UIPadding", {
+		PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5),
+		PaddingLeft = UDim.new(0, 2), PaddingRight = UDim.new(0, 2),
+	}, ScrollTab)
+
+	local BottomBar = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+		Position = UDim2.new(0, 0, 1, -46), Size = UDim2.new(1, 0, 0, 46), Name = "BottomBar",
+	}, Main)
+	Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Border, BackgroundTransparency = 0.45, BorderSizePixel = 0,
+		Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(1, 0, 0, 1), Name = "BottomBarDivider",
+	}, BottomBar)
+	local AvatarFooter = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(0, TabWidth, 1, 0), Name = "AvatarFooter",
+	}, BottomBar)
+
+	-- VLH is a quiet footer caption, not a badge/pill. Set Config.VLH = "Free 0.1".
+	local VLH = tostring(Config.VLH or Config.FooterCenterText or Config.VersionText or "Free 0.1")
+	local VLHLabel = Custom:Label(BottomBar, {
+		Text = VLH, Font = Enum.Font.Gotham, TextColor3 = Theme.Sub, TextSize = 9,
+		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(0, 120, 0, 18), Name = "VLHFooterLabel",
+	})
+
+	local FooterRightText = tostring(Config.FooterRightText or "")
+	if FooterRightText ~= "" then
+		local FooterRightPill = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -146, 0.5, 0),
+			Size = UDim2.new(0, tonumber(Config.FooterRightWidth) or 96, 0, 24),
+			BackgroundColor3 = Theme.Field, BackgroundTransparency = 0, BorderSizePixel = 0,
+			Name = "FooterRightPill",
+		}, BottomBar)
+		Custom:Corner(FooterRightPill, 20)
+		Custom:Stroke(FooterRightPill, Theme.Border, 0.5, 1)
+		local FooterRightIcon = Custom:MakeIcon(FooterRightPill, Config.FooterRightIcon or "clock", {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 12, 0.5, 0),
+			Size = UDim2.new(0, 15, 0, 15), Color = Theme.Sub, Name = "FooterRightIcon",
+		})
+		Custom:Label(FooterRightPill, {
+			Text = FooterRightText, TextColor3 = Theme.Text, TextSize = 11,
+			Position = UDim2.new(0, FooterRightIcon and 37 or 12, 0, 0),
+			Size = UDim2.new(1, FooterRightIcon and -46 or -24, 1, 0),
+			TextYAlignment = Enum.TextYAlignment.Center, Name = "FooterRightLabel",
+		})
+	end
+
+	local AvatarImage = Custom:Create("ImageLabel", {
+		Image = "rbxasset://textures/ui/GuiImagePlaceholder.png", AnchorPoint = Vector2.new(0, 0.5),
+		BackgroundColor3 = Theme.Panel, BorderSizePixel = 0,
+		Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.new(0, 30, 0, 30), Name = "AvatarImage",
+	}, AvatarFooter)
+	Custom:Round(AvatarImage)
+	Custom:Stroke(AvatarImage, Theme.White, 0.4, 1.2)
+
+	local HeaderProfileButton = Custom:Create("ImageButton", {
+		AutoButtonColor = false, BackgroundColor3 = Theme.Field, BackgroundTransparency = 0,
+		BorderSizePixel = 0, AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -68, 0.5, 0), Size = UDim2.new(0, 24, 0, 24),
+		Image = AvatarImage.Image, ScaleType = Enum.ScaleType.Crop, Name = "HeaderProfileButton",
+	}, Top)
+	Custom:Corner(HeaderProfileButton, 8)
+	Custom:Stroke(HeaderProfileButton, Theme.Border, 0.45, 1)
+
+	local function CensorName(Name)
+		if #Name <= 3 then return Name end
+		return Name:sub(1, 3) .. "***"
+	end
+	Custom:Label(AvatarFooter, {
+		Text = Player.DisplayName, TextColor3 = Theme.Text, TextSize = 10,
+		TextTruncate = Enum.TextTruncate.AtEnd, TextYAlignment = Enum.TextYAlignment.Center,
+		Position = UDim2.new(0, 48, 0, 6), Size = UDim2.new(1, -56, 0, 16), Name = "WelcomeLabel",
+	})
+	Custom:Label(AvatarFooter, {
+		Text = "@" .. CensorName(Player.Name), TextColor3 = Theme.Sub, TextSize = 9,
+		TextTruncate = Enum.TextTruncate.AtEnd, TextYAlignment = Enum.TextYAlignment.Center,
+		Position = UDim2.new(0, 48, 0, 23), Size = UDim2.new(1, -56, 0, 14), Name = "WelcomeSubtitle",
+	})
+
+	local DiscordInviteURL = "https://discord.gg/GrWpVXbWfj"
+	local DiscordFooterButton = Custom:Create("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundColor3 = Theme.Field, BorderSizePixel = 0,
+		Position = UDim2.new(0, TabWidth + 10, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5),
+		Size = UDim2.new(0, 76, 0, 26), Name = "DiscordFooterButton",
+	}, BottomBar)
+	Custom:Corner(DiscordFooterButton, 4)
+	Custom:Stroke(DiscordFooterButton, Theme.Border, 0.45, 1)
+	Custom:MakeIcon(DiscordFooterButton, "message-circle", {
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 7, 0.5, 0),
+		Size = UDim2.new(0, 13, 0, 13), Color = Theme.Text, Name = "DiscordFooterIcon",
+	})
+	Custom:Label(DiscordFooterButton, {
+		Text = "Discord", TextColor3 = Theme.Text, TextSize = 10,
+		Position = UDim2.new(0, 25, 0, 0), Size = UDim2.new(1, -29, 1, 0),
+		TextYAlignment = Enum.TextYAlignment.Center, Name = "DiscordFooterLabel",
+	})
+	DiscordFooterButton.Activated:Connect(function()
+		local OpenedDiscord = pcall(function()
+			GuiService:OpenBrowserWindow(DiscordInviteURL)
+		end)
+		if not OpenedDiscord then
+			local CopyFn = setclipboard or toclipboard
+			if type(CopyFn) == "function" then
+				local Copied = pcall(CopyFn, DiscordInviteURL)
+				if Copied then
+					pcall(function() Rexxzy_Library:SetNotification({ Type = "info", Content = "Discord invite copied", Delay = 2 }) end)
+				end
+			end
+		end
+	end)
+
+	local FPSChip = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -76, 0.5, 0),
+		Size = UDim2.new(0, 62, 0, 24), BackgroundColor3 = Theme.Field,
+		BorderSizePixel = 0, Name = "FPSChip",
+	}, BottomBar)
+	Custom:Corner(FPSChip, 4)
+	Custom:Label(FPSChip, {
+		Text = "FPS --", TextColor3 = Theme.Sub, TextSize = 9,
+		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+		Size = UDim2.new(1, 0, 1, 0), Name = "FPSValue",
+	})
+	local PingChip = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0),
+		Size = UDim2.new(0, 62, 0, 24), BackgroundColor3 = Theme.Field,
+		BorderSizePixel = 0, Name = "PingChip",
+	}, BottomBar)
+	Custom:Corner(PingChip, 4)
+	local PingValueLabel = Custom:Label(PingChip, {
+		Text = "PING --", TextColor3 = Theme.Sub, TextSize = 9,
+		TextXAlignment = Enum.TextXAlignment.Center, TextYAlignment = Enum.TextYAlignment.Center,
+		Size = UDim2.new(1, 0, 1, 0), Name = "PingValue",
+	})
+	local FPSValueLabel = FPSChip:FindFirstChild("FPSValue")
+	local FrameCount, SampleTime = 0, 0
+	Track(RunService.RenderStepped:Connect(function(DeltaTime)
+		if Destroyed or not RexxzyGui.Parent then return end
+		FrameCount = FrameCount + 1
+		SampleTime = SampleTime + DeltaTime
+		if SampleTime >= 0.5 then
+			local FPS = math.floor((FrameCount / math.max(SampleTime, 0.001)) + 0.5)
+			FPSValueLabel.Text = "FPS " .. tostring(FPS)
+			FrameCount, SampleTime = 0, 0
+			local Ping = nil
+			local Ok, Value = pcall(function() return Player:GetNetworkPing() * 1000 end)
+			if Ok and type(Value) == "number" then Ping = math.floor(Value + 0.5) end
+			PingValueLabel.Text = Ping and ("PING " .. tostring(Ping) .. "ms") or "PING --"
+		end
+	end))
+
+	task.spawn(function()
+		local ok, url = pcall(function()
+			return Players:GetUserThumbnailAsync(Player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		end)
+		if ok and url then
+			AvatarImage.Image = url
+			if HeaderProfileButton then HeaderProfileButton.Image = url end
+		end
+	end)
+
+	
+	local ProfileCfg = type(Config.Profile) == "table" and Config.Profile or {}
+	local SupportLink = tostring(ProfileCfg.SupportLink or Config.SupportLink or Config.SupportURL or "")
+	local SupportText = tostring(ProfileCfg.SupportText or Config.SupportText or "Open support link")
+	local ProfileOpen = false
+	local ProfileToken = 0
+
+	local function ProfileNotice(Text, Kind)
+		pcall(function()
+			Rexxzy_Library:SetNotification({ Type = Kind or "info", Content = tostring(Text), Delay = 3 })
+		end)
+	end
+
+	local function CopyProfileValue(Value, Label)
+		local Text = tostring(Value or "")
+		local Clipboard = setclipboard or toclipboard
+		if Clipboard and Text ~= "" then
+			local Ok = pcall(Clipboard, Text)
+			if Ok then ProfileNotice((Label or "Value") .. " copied", "success") return true end
+		end
+		ProfileNotice("Clipboard is not supported by this executor", "warning")
+		return false
+	end
+
+	local function OpenProfileLink()
+		if SupportLink == "" then
+			ProfileNotice("Set Config.SupportLink to add a support link", "warning")
+			return
+		end
+		local Ok = pcall(function()
+			game:GetService("GuiService"):OpenBrowserWindow(SupportLink)
+		end)
+		if not Ok then CopyProfileValue(SupportLink, "Support link") end
+	end
+
+	local ProfileHitbox = Custom:Create("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0), Position = UDim2.new(0, 0, 0, 0), ZIndex = 12,
+		Name = "ProfileHitbox",
+	}, AvatarFooter)
+	Custom:Label(AvatarFooter, {
+		Text = "›", TextColor3 = Theme.Sub, TextSize = 20, TextXAlignment = Enum.TextXAlignment.Center,
+		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -7, 0.5, 0),
+		Size = UDim2.new(0, 12, 0, 22), ZIndex = 13, Name = "ProfileArrow",
+	})
+
+	local ProfileOverlay = Custom:Create("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundColor3 = Color3.new(0, 0, 0),
+		BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0),
+		Visible = false, ZIndex = 30, Name = "ProfileOverlay",
+	}, Main)
+
+	local ProfilePanel = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = MobileLayout and UDim2.new(0.94, 0, 0.92, 0) or UDim2.new(0.82, 0, 0.86, 0), BackgroundColor3 = Theme.Black,
+		BorderSizePixel = 0, ClipsDescendants = true, Visible = false,
+		ZIndex = 31, Name = "ProfilePanel",
+	}, Main)
+	Custom:Corner(ProfilePanel, 10)
+	local ProfileStroke = Custom:Stroke(ProfilePanel, Theme.White, 0.65, 1)
+	local ProfileScale = Custom:Create("UIScale", { Scale = 0.92 }, ProfilePanel)
+
+	local ProfileHeader = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.new(0, 10, 0, 0),
+		Size = UDim2.new(1, -20, 0, 38), ZIndex = 32, Name = "ProfileHeader",
+	}, ProfilePanel)
+	Custom:Label(ProfileHeader, {
+		Text = "PROFILE", TextColor3 = Theme.White, TextSize = 12,
+		Position = UDim2.new(0, 0, 0, 0), Size = UDim2.new(1, -36, 1, 0), ZIndex = 33,
+		Name = "ProfileTitle",
+	})
+	local ProfileClose = Custom:Create("TextButton", {
+		Text = "×", Font = Enum.Font.Gotham, TextSize = 22, TextColor3 = Theme.White,
+		AutoButtonColor = false, BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.1,
+		BorderSizePixel = 0, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, 0, 0.5, 0),
+		Size = UDim2.new(0, 27, 0, 27), ZIndex = 34, Name = "ProfileClose",
+	}, ProfileHeader)
+	Custom:Corner(ProfileClose, 6)
+
+	local ProfileBody = Custom:Create("ScrollingFrame", {
+		Active = true, BackgroundTransparency = 1, BorderSizePixel = 0,
+		Position = UDim2.new(0, 9, 0, 40), Size = UDim2.new(1, -18, 1, -48),
+		CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollBarThickness = MobileLayout and 3 or 2, ScrollBarImageColor3 = Theme.Sub, ScrollingDirection = Enum.ScrollingDirection.Y,
+		ZIndex = 32, Name = "ProfileBody",
+	}, ProfilePanel)
+	Custom:Create("UIListLayout", {
+		Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder,
+	}, ProfileBody)
+	Custom:Create("UIPadding", {
+		PaddingTop = UDim.new(0, 2), PaddingBottom = UDim.new(0, 4),
+		PaddingLeft = UDim.new(0, 1), PaddingRight = UDim.new(0, 1),
+	}, ProfileBody)
+
+	local ProfileHero = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.15, BorderSizePixel = 0,
+		Size = UDim2.new(1, -2, 0, 62), ZIndex = 33, LayoutOrder = 1, Name = "ProfileHero",
+	}, ProfileBody)
+	Custom:Corner(ProfileHero, 8)
+	Custom:Stroke(ProfileHero, Theme.White, 0.9, 1)
+	local ProfileAvatar = Custom:Create("ImageLabel", {
+		Image = AvatarImage.Image, BackgroundColor3 = Theme.Black, BorderSizePixel = 0,
+		Position = UDim2.new(0, 8, 0.5, -21), Size = UDim2.new(0, 42, 0, 42),
+		ZIndex = 34, Name = "ProfileAvatar",
+	}, ProfileHero)
+	Custom:Round(ProfileAvatar)
+	Custom:Stroke(ProfileAvatar, Theme.White, 0.5, 1)
+	Custom:Label(ProfileHero, {
+		Text = Player.DisplayName, TextColor3 = Theme.White, TextSize = 13,
+		Position = UDim2.new(0, 59, 0, 11), Size = UDim2.new(1, -68, 0, 19),
+		TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 34, Name = "ProfileDisplayName",
+	})
+	Custom:Label(ProfileHero, {
+		Text = "@" .. Player.Name, TextColor3 = Theme.Sub, TextSize = 10,
+		Position = UDim2.new(0, 59, 0, 31), Size = UDim2.new(1, -68, 0, 16),
+		TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 34, Name = "ProfileUsername",
+	})
+
+	local AccountCard = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+		Size = UDim2.new(1, -2, 0, 105), ZIndex = 33, LayoutOrder = 2, Name = "AccountInfo",
+	}, ProfileBody)
+	Custom:Corner(AccountCard, 8)
+	Custom:Stroke(AccountCard, Theme.White, 0.92, 1)
+	local function AccountLine(Y, LabelText, ValueText)
+		Custom:Label(AccountCard, {
+			Text = LabelText, TextColor3 = Theme.Sub, TextSize = 9,
+			Position = UDim2.new(0, 9, 0, Y), Size = UDim2.new(0.32, 0, 0, 17),
+			ZIndex = 34,
+		})
+		Custom:Label(AccountCard, {
+			Text = tostring(ValueText), TextColor3 = Theme.Text, TextSize = 9,
+			TextTruncate = Enum.TextTruncate.AtEnd, Position = UDim2.new(0.32, 0, 0, Y),
+			Size = UDim2.new(0.66, -8, 0, 17), ZIndex = 34,
+		})
+	end
+	AccountLine(5, "USERNAME", Player.Name)
+	AccountLine(25, "USER ID", Player.UserId)
+	AccountLine(45, "PLACE ID", game.PlaceId)
+	AccountLine(65, "EXECUTOR", SafeGetExecutor())
+	AccountLine(85, "DISPLAY", Player.DisplayName)
+
+	local function ProfileActionButton(Parent, Text, Position, Size, Callback, Name)
+		local Btn = Custom:Create("TextButton", {
+			Text = Text, Font = Enum.Font.GothamBold, TextSize = MobileLayout and 9 or 9, TextColor3 = Theme.Text,
+			AutoButtonColor = false, BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.05,
+			BorderSizePixel = 0, Position = Position, Size = Size, ZIndex = 35, Name = Name or "ProfileAction",
+		}, Parent)
+		Custom:Corner(Btn, 6)
+		local Stroke = Custom:Stroke(Btn, Theme.White, 0.88, 1)
+		Btn.MouseEnter:Connect(function() Custom:Tween(Stroke, 0.12, { Transparency = 0.45 }) end)
+		Btn.MouseLeave:Connect(function() Custom:Tween(Stroke, 0.15, { Transparency = 0.88 }) end)
+		Btn.Activated:Connect(function()
+			if Callback then Callback() end
+		end)
+		return Btn
+	end
+
+	local CopyActions = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, -2, 0, 30),
+		ZIndex = 33, LayoutOrder = 3, Name = "CopyActions",
+	}, ProfileBody)
+	ProfileActionButton(CopyActions, MobileLayout and "USER ID" or "COPY USER ID", UDim2.new(0, 0, 0, 0), UDim2.new(0.33, -4, 1, 0), function()
+		CopyProfileValue(Player.UserId, "User ID")
+	end, "CopyUserId")
+	ProfileActionButton(CopyActions, MobileLayout and "PLACE ID" or "COPY PLACE ID", UDim2.new(0.335, 0, 0, 0), UDim2.new(0.33, -4, 1, 0), function()
+		CopyProfileValue(game.PlaceId, "Place ID")
+	end, "CopyPlaceId")
+	ProfileActionButton(CopyActions, MobileLayout and "JOB ID" or "COPY JOB ID", UDim2.new(0.67, 0, 0, 0), UDim2.new(0.33, -2, 1, 0), function()
+		CopyProfileValue(game.JobId, "Job ID")
+	end, "CopyJobId")
+
+	local BackgroundCard = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.15, BorderSizePixel = 0,
+		Size = UDim2.new(1, -2, 0, 132), ZIndex = 33, LayoutOrder = 4, Name = "CustomBackground",
+	}, ProfileBody)
+	Custom:Corner(BackgroundCard, 8)
+	Custom:Stroke(BackgroundCard, Theme.White, 0.9, 1)
+	Custom:Label(BackgroundCard, {
+		Text = "CUSTOM BACKGROUND", TextColor3 = Theme.White, TextSize = 10,
+		Position = UDim2.new(0, 9, 0, 7), Size = UDim2.new(1, -18, 0, 16), ZIndex = 34,
+	})
+	Custom:Label(BackgroundCard, {
+		Text = "Paste a Roblox asset ID or a direct image URL.", TextColor3 = Theme.Sub, TextSize = 9,
+		Position = UDim2.new(0, 9, 0, 23), Size = UDim2.new(1, -18, 0, 14), ZIndex = 34,
+	})
+	local BackgroundInput = Custom:Create("TextBox", {
+		Font = Enum.Font.Gotham, Text = "", PlaceholderText = "Asset ID / https://image...",
+		PlaceholderColor3 = Theme.Sub, TextColor3 = Theme.Text, TextSize = 10,
+		TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
+		BackgroundColor3 = Theme.Black, BackgroundTransparency = 0.05, BorderSizePixel = 0,
+		Position = UDim2.new(0, 8, 0, 43), Size = UDim2.new(1, -16, 0, 27),
+		ZIndex = 35, Name = "BackgroundInput",
+	}, BackgroundCard)
+	Custom:Corner(BackgroundInput, 6)
+	Custom:Stroke(BackgroundInput, Theme.White, 0.9, 1)
+	local BackgroundStatus = Custom:Label(BackgroundCard, {
+		Text = "Changes apply to this session.", TextColor3 = Theme.Sub, TextSize = 8,
+		Position = UDim2.new(0, 9, 0, 108), Size = UDim2.new(1, -18, 0, 14), ZIndex = 34,
+		Name = "BackgroundStatus",
+	})
+
+	local function NormalizeBackgroundSource(Value)
+		local Source = tostring(Value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		if Source == "" then return nil end
+		if Source:match("^%d+$") then
+			if (tonumber(Source) or 0) <= 0 then return nil end
+			return "rbxassetid://" .. Source
+		end
+		local RobloxAssetId = Source:match("[?&]id=(%d+)") or Source:match("/asset/(%d+)")
+		if RobloxAssetId and (Source:find("roblox.com", 1, true) or Source:find("rbxasset", 1, true)) then
+			return "rbxassetid://" .. RobloxAssetId
+		end
+		if Source:match("^rbxassetid://%d+$") or Source:match("^rbxasset://") or Source:match("^rbxthumb://") then
+			return Source
+		end
+		if Source:match("^https?://") then return Source end
+		return nil
+	end
+
+	local function ApplyProfileBackground()
+		local Source = NormalizeBackgroundSource(BackgroundInput.Text)
+		if not Source then
+			BackgroundStatus.Text = "Enter a valid asset ID or image URL."
+			BackgroundStatus.TextColor3 = Theme.Sub
+			return
+		end
+		local Ok = ApplyBackground(Source)
+		if Ok then
+			BackgroundStatus.Text = "Background request applied."
+			BackgroundStatus.TextColor3 = Theme.White
+			ProfileNotice("Custom background applied", "success")
+		else
+			BackgroundStatus.Text = "Could not apply this background."
+			BackgroundStatus.TextColor3 = Theme.Sub
+			ProfileNotice("Could not apply background", "warning")
+		end
+	end
+
+	ProfileActionButton(BackgroundCard, "APPLY", UDim2.new(0, 8, 0, 76), UDim2.new(0.34, -5, 0, 25), ApplyProfileBackground, "ApplyBackground")
+	ProfileActionButton(BackgroundCard, "CLEAR", UDim2.new(0.34, 3, 0, 76), UDim2.new(0.33, -5, 0, 25), function()
+		ApplyBackground(nil)
+		BackgroundStatus.Text = "Background cleared."
+		BackgroundStatus.TextColor3 = Theme.White
+		ProfileNotice("Background cleared", "success")
+	end, "ClearBackground")
+	ProfileActionButton(BackgroundCard, "RESET", UDim2.new(0.67, 2, 0, 76), UDim2.new(0.33, -10, 0, 25), function()
+		BackgroundInput.Text = ""
+		if DefaultBackground == false or DefaultBackground == "" then
+			ApplyBackground(nil)
+		else
+			ApplyBackground(DefaultBackground)
+		end
+		BackgroundStatus.Text = "Default background restored."
+		BackgroundStatus.TextColor3 = Theme.White
+		ProfileNotice("Default background restored", "success")
+	end, "ResetBackground")
+	BackgroundInput.FocusLost:Connect(function(EnterPressed)
+		if EnterPressed then ApplyProfileBackground() end
+	end)
+
+	local SupportCard = Custom:Create("Frame", {
+		BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+		Size = UDim2.new(1, -2, 0, 43), ZIndex = 33, LayoutOrder = 5, Name = "SupportCard",
+	}, ProfileBody)
+	Custom:Corner(SupportCard, 8)
+	Custom:Stroke(SupportCard, Theme.White, 0.92, 1)
+	Custom:Label(SupportCard, {
+		Text = "SUPPORT", TextColor3 = Theme.Sub, TextSize = 9,
+		Position = UDim2.new(0, 9, 0, 0), Size = UDim2.new(0.33, 0, 1, 0), ZIndex = 34,
+	})
+	local SupportButton = ProfileActionButton(SupportCard, SupportText, UDim2.new(0.34, 0, 0.5, -13), UDim2.new(0.64, -8, 0, 26), OpenProfileLink, "SupportLinkButton")
+	SupportButton.TextTruncate = Enum.TextTruncate.AtEnd
+
+	local function SetProfileSupportLink(URL, Label)
+		SupportLink = tostring(URL or "")
+		if Label ~= nil then SupportText = tostring(Label) end
+		SupportButton.Text = SupportText
+		SupportCard.Visible = SupportLink ~= ""
+	end
+	SupportCard.Visible = SupportLink ~= ""
+
+	local function CloseProfile()
+		if not ProfileOpen then return end
+		ProfileOpen = false
+		ProfileToken = ProfileToken + 1
+		local Token = ProfileToken
+		Custom:Tween(ProfileOverlay, 0.16, { BackgroundTransparency = 1 })
+		Custom:Tween(ProfileScale, 0.16, { Scale = 0.94 })
+		task.delay(0.17, function()
+			if Token ~= ProfileToken or ProfileOpen then return end
+			ProfileOverlay.Visible = false
+			ProfilePanel.Visible = false
+		end)
+	end
+
+	local function OpenProfile()
+		if Destroyed then return end
+		ProfileOpen = true
+		ProfileToken = ProfileToken + 1
+		ProfileAvatar.Image = AvatarImage.Image
+		ProfileOverlay.Visible = true
+		ProfilePanel.Visible = true
+		ProfileOverlay.BackgroundTransparency = 1
+		ProfileScale.Scale = 0.94
+		ProfileStroke.Transparency = 1
+		Custom:Tween(ProfileOverlay, 0.18, { BackgroundTransparency = 0.42 })
+		Custom:Tween(ProfileScale, 0.22, { Scale = 1 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		Custom:Tween(ProfileStroke, 0.2, { Transparency = 0.65 })
+	end
+
+	ProfileHitbox.Activated:Connect(OpenProfile)
+	HeaderProfileButton.Activated:Connect(OpenProfile)
+	ProfileClose.Activated:Connect(CloseProfile)
+	ProfileOverlay.Activated:Connect(CloseProfile)
+
+	local SearchPopup = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0, 1), BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0, BorderSizePixel = 0,
+		ClipsDescendants = true, Position = UDim2.new(0, 8, 1, -58), Size = UDim2.new(1, -16, 0, 0),
+		Visible = false, ZIndex = 20, Name = "SearchPopup",
+	}, Side)
+	Custom:Corner(SearchPopup, 8)
+	Custom:Stroke(SearchPopup, Theme.White, 0.75, 1)
+	Custom:Create("UIListLayout", { Padding = UDim.new(0, 0), SortOrder = Enum.SortOrder.LayoutOrder }, SearchPopup)
+
+	-- Re-apply the fixed topbar/sidebar/footer geometry after a resize.
+	local function RefreshSidebarLayout()
+		if Destroyed or not DropShadowHolder.Parent then return end
+		Side.Size = UDim2.new(0, TabWidth, 1, -102)
+		SearchBoxContainer.Position = UDim2.new(0, 8, 1, -7)
+		SearchBoxContainer.Size = UDim2.new(1, -16, 0, 32)
+		ScrollTab.Position = UDim2.new(0, 7, 0, 7)
+		ScrollTab.Size = UDim2.new(1, -10, 1, -43)
+		SearchPopup.Position = UDim2.new(0, 8, 1, -48)
+		Layers.Position = UDim2.new(0, TabWidth + 1, 0, 50)
+		Layers.Size = UDim2.new(1, -(TabWidth + 1), 1, -96)
+		LayersReal.Position = UDim2.new(0, 9, 0, 0)
+		LayersReal.Size = UDim2.new(1, -18, 1, 0)
+		AvatarFooter.Size = UDim2.new(0, TabWidth, 1, 0)
+		if VLHLabel and VLHLabel.Parent then
+			local FooterWidth = BottomBar.AbsoluteSize.X / math.max(WindowScale.Scale, 0.01)
+			local LeftEdge = TabWidth + 96
+			local RightEdge = FooterWidth - 140
+			local FreeWidth = math.max(0, RightEdge - LeftEdge)
+			local MidX = LeftEdge + FreeWidth / 2
+			VLHLabel.Position = UDim2.new(0, MidX, 0.5, 0)
+			VLHLabel.Size = UDim2.new(0, math.min(120, FreeWidth), 0, 18)
+			VLHLabel.Visible = FreeWidth >= 44
+		end
+	end
+	Track(DropShadowHolder:GetPropertyChangedSignal("Size"):Connect(function()
+		task.defer(RefreshSidebarLayout)
+	end))
+	task.defer(RefreshSidebarLayout)
+
+	local function RegisterSearch(Title, TargetFrame, Subtitle, SelectTabFn, EnsureOpenFn, ScrollFrameRef)
+		if Title == "" then return end
+		table.insert(SearchRegistry, { Title = Title, Subtitle = Subtitle or "", TargetFrame = TargetFrame, SelectTab = SelectTabFn, EnsureOpen = EnsureOpenFn, ScrollFrame = ScrollFrameRef })
+	end
+
+	local function ClearSearchPopup()
+		for _, v in pairs(SearchPopup:GetChildren()) do if v.Name == "ResultRow" then v:Destroy() end end
+	end
+
+	local function HideSearchPopup()
+		SearchPopup.Visible = false
+		SearchPopup.Size = UDim2.new(1, 0, 0, 0)
+		ScrollTab.Visible = true
+		ClearSearchPopup()
+	end
+
+	local function ScrollIntoView(SF, TF)
+		task.wait(0.15)
+		if not (SF and TF and SF.Parent and TF.Parent) then return end
+		local ry = (TF.AbsolutePosition.Y - SF.AbsolutePosition.Y) + SF.CanvasPosition.Y
+		Custom:Tween(SF, 0.35, { CanvasPosition = Vector2.new(0, math.max(ry - 20, 0)) })
+	end
+
+	local function RunSearch(Query)
+		Query = string.lower(Query)
+		HideSearchPopup()
+		if Query == "" then return end
+		local Matches = {}
+		for _, e in ipairs(SearchRegistry) do
+			if e.TargetFrame and e.TargetFrame.Parent and string.find(string.lower(e.Title), Query, 1, true) then
+				table.insert(Matches, e)
+				if #Matches >= 8 then break end
+			end
+		end
+		if #Matches == 0 then return end
+		ScrollTab.Visible = false
+		for i, Entry in ipairs(Matches) do
+			local Row = Custom:Create("TextButton", {
+				Text = "", AutoButtonColor = false, BackgroundColor3 = Theme.White, BackgroundTransparency = 1,
+				BorderSizePixel = 0, LayoutOrder = i, Size = UDim2.new(1, 0, 0, 34), Name = "ResultRow",
+			}, SearchPopup)
+			if i < #Matches then
+				Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(0, 1), BackgroundColor3 = Theme.White, BackgroundTransparency = 0.9,
+					BorderSizePixel = 0, Position = UDim2.new(0, 8, 1, 0), Size = UDim2.new(1, -16, 0, 1), Name = "Divider",
+				}, Row)
+			end
+			local Accent = Custom:Create("Frame", {
+				BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+				Position = UDim2.new(0, 3, 0.5, -6), Size = UDim2.new(0, 2, 0, 12), Name = "RA",
+			}, Row)
+			Custom:Round(Accent)
+			Custom:Label(Row, {
+				Text = Entry.Title, TextColor3 = Theme.White, TextSize = 11, TextTruncate = Enum.TextTruncate.AtEnd,
+				Position = UDim2.new(0, 11, 0, 4), Size = UDim2.new(1, -14, 0, 14), Name = "RT",
+			})
+			Custom:Label(Row, {
+				Font = Enum.Font.Gotham, Text = Entry.Subtitle, TextColor3 = Theme.Sub, TextSize = 9,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+				Position = UDim2.new(0, 11, 0, 18), Size = UDim2.new(1, -14, 0, 11), Name = "RS",
+			})
+			Row.MouseEnter:Connect(function() Custom:Tween(Row, 0.12, { BackgroundTransparency = 0.92 }) end)
+			Row.MouseLeave:Connect(function() Custom:Tween(Row, 0.12, { BackgroundTransparency = 1 }) end)
+			Row.Activated:Connect(function()
+				SearchBox.Text = ""
+				HideSearchPopup()
+				if Entry.SelectTab then Entry.SelectTab() end
+				task.spawn(function()
+					task.wait(0.1)
+					if Entry.EnsureOpen then Entry.EnsureOpen() end
+					if Entry.ScrollFrame and Entry.TargetFrame then ScrollIntoView(Entry.ScrollFrame, Entry.TargetFrame) end
+					task.wait(0.3)
+					if Entry.TargetFrame then Custom:Highlight(Entry.TargetFrame) end
+				end)
+			end)
+		end
+		SearchPopup.Size = UDim2.new(1, -16, 0, math.min(#Matches * 34, 200))
+		SearchPopup.Visible = true
+	end
+	SearchBox:GetPropertyChangedSignal("Text"):Connect(function() RunSearch(SearchBox.Text) end)
+
+	local BubbleCfg = Config.Bubble or Config.BubbleIcon or Config.FloatIcon or Config.OpenIcon
+	local BubbleEnabled = Config.BubbleEnabled ~= false
+	local BubblePlatform = tostring(Config.BubblePlatform or "Both")
+	local BubbleSize = 58
+	local BubbleSrc = "VH" 
+	local BubblePos = UDim2.new(0.1021, 0, 0.0743, 0)
+	if type(BubbleCfg) == "table" then
+		BubbleSrc = BubbleCfg.Icon or BubbleCfg.Image or BubbleCfg[1] or BubbleSrc
+		BubbleSize = tonumber(BubbleCfg.Size) or BubbleSize
+		if typeof(BubbleCfg.Position) == "UDim2" then BubblePos = BubbleCfg.Position end
+	elseif BubbleCfg ~= nil and BubbleCfg ~= false and BubbleCfg ~= "" then
+		BubbleSrc = BubbleCfg
+	end
+	local Bubble = Custom:Create("TextButton", {
+		Name = "OpenClose", Text = "", AutoButtonColor = false, BackgroundColor3 = Theme.Black, BorderSizePixel = 0,
+		Position = BubblePos, Size = UDim2.new(0, BubbleSize, 0, BubbleSize), Visible = false,
+	}, RexxzyGui)
+	Custom:Round(Bubble)
+	local BubbleStroke = Custom:Stroke(Bubble, Color3.fromRGB(255, 255, 255), 0, 1.5)
+	local BubbleContent = nil
+	local function ApplyBubble(Src)
+		if BubbleContent then BubbleContent:Destroy() end
+		BubbleContent = Custom:Create("Frame", {
+			BackgroundTransparency = 1, BorderSizePixel = 0, ClipsDescendants = true, Size = UDim2.new(1, 0, 1, 0), Name = "BubbleContent",
+		}, Bubble)
+		Custom:Round(BubbleContent)
+		local Obj = Custom:MakeIcon(BubbleContent, Src, {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+			Size = UDim2.new(0, math.floor(BubbleSize * 0.52), 0, math.floor(BubbleSize * 0.52)), Color = Theme.White, Name = "BubbleIcon",
+		})
+		if not Obj then
+			Obj = Custom:MakeIcon(BubbleContent, "hub", {
+				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+				Size = UDim2.new(0, math.floor(BubbleSize * 0.52), 0, math.floor(BubbleSize * 0.52)), Color = Theme.White, Name = "BubbleIcon",
+			})
+		elseif Obj.Kind == "image" then
+			Obj.Instance.AnchorPoint = Vector2.new(0, 0)
+			Obj.Instance.Position = UDim2.new(0, 0, 0, 0)
+			Obj.Instance.Size = UDim2.new(1, 0, 1, 0)
+			Obj.Image.ScaleType = Enum.ScaleType.Crop
+		end
+	end
+	ApplyBubble(BubbleSrc)
+	local function ClampBubble()
+		local Scr = RexxzyGui.AbsoluteSize
+		local Pos, Sz = Bubble.AbsolutePosition, Bubble.AbsoluteSize
+		if Scr.X <= 0 or Scr.Y <= 0 then return end
+		local Dx = math.clamp(Pos.X, 0, math.max(Scr.X - Sz.X, 0)) - Pos.X
+		local Dy = math.clamp(Pos.Y, 0, math.max(Scr.Y - Sz.Y, 0)) - Pos.Y
+		if Dx ~= 0 or Dy ~= 0 then
+			local Cur = Bubble.Position
+			Bubble.Position = UDim2.new(Cur.X.Scale, Cur.X.Offset + Dx, Cur.Y.Scale, Cur.Y.Offset + Dy)
+		end
+	end
+
+	local BDrag, BStart, BPos, BMoved = false, nil, nil, false
+	Bubble.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.Touch or i.UserInputType == Enum.UserInputType.MouseButton1 then
+			BDrag = true BMoved = false BStart = i.Position BPos = Bubble.Position
+			i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then BDrag = false end end)
+		end
+	end)
+	Track(UserInputService.InputChanged:Connect(function(i)
+		if BDrag and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - BStart
+			if math.abs(d.X) + math.abs(d.Y) > 6 then BMoved = true end
+			if BMoved then
+				Bubble.Position = UDim2.new(BPos.X.Scale, BPos.X.Offset + d.X, BPos.Y.Scale, BPos.Y.Offset + d.Y)
+				ClampBubble()
+			end
+		end
+	end))
+
+	local function ShouldShowBubble()
+		if not BubbleEnabled then return false end
+		local Platform = string.lower(tostring(BubblePlatform))
+		if Platform == "mobile" or Platform == "mobile only" then
+			return UserInputService.TouchEnabled
+		end
+		return true
+	end
+
+	local function SetOpen(State)
+		if Destroyed then return end
+		Opened = State
+		if State then
+			Bubble.Visible = false
+			WindowScale.Scale = Base
+			DropShadowHolder.Visible = true
+		else
+			WindowScale.Scale = Base
+			DropShadowHolder.Visible = false
+			Bubble.Visible = ShouldShowBubble()
+		end
+	end
+
+	Bubble.Activated:Connect(function()
+		if BMoved then BMoved = false return end
+		SetOpen(true)
+	end)
+	Min.Activated:Connect(function()
+		CircleClick(Min)
+		SetOpen(false)
+	end)
+	Track(UserInputService.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		if input.KeyCode == Keybind then SetOpen(not Opened) end
+	end))
+
+	local Dragging, DragStart, StartPos = false, nil, nil
+	DragHandle.InputBegan:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			Dragging = true DragStart = i.Position StartPos = DropShadowHolder.Position
+			i.Changed:Connect(function() if i.UserInputState == Enum.UserInputState.End then Dragging = false end end)
+		end
+	end)
+	Track(UserInputService.InputChanged:Connect(function(i)
+		if Dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+			local d = i.Position - DragStart
+			DropShadowHolder.Position = UDim2.new(StartPos.X.Scale, StartPos.X.Offset + d.X, StartPos.Y.Scale, StartPos.Y.Offset + d.Y)
+		end
+	end))
+	Track(UserInputService.InputEnded:Connect(function(i)
+		if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+			Dragging = false BDrag = false
+		end
+	end))
+
+	local ExitBackdrop = Custom:Create("Frame", {
+		Active = true, BackgroundColor3 = Theme.Black, BackgroundTransparency = 0,
+		BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), Visible = false, ZIndex = 49, Name = "ExitBackdrop",
+	}, Main)
+	local ExitConfirm = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.Black,
+		BorderSizePixel = 0, Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 208, 0, 88),
+		Visible = false, ZIndex = 50, Name = "ExitConfirm",
+	}, Main)
+	Custom:Corner(ExitConfirm, 5)
+	Custom:Stroke(ExitConfirm, Theme.Border, 0.35, 1)
+	Custom:Label(ExitConfirm, {
+		Text = "Close window?", TextColor3 = Theme.White, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+		Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -24, 0, 26), Name = "ExitTitle",
+	})
+	Custom:Label(ExitConfirm, {
+		Font = Enum.Font.Gotham, Text = "This will close the library window.", TextColor3 = Theme.Sub, TextSize = 9, TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+		Position = UDim2.new(0, 12, 0, 26), Size = UDim2.new(1, -24, 0, 18), Name = "ExitDesc",
+	})
+	local CancelButton = Custom:Create("TextButton", {
+		Font = Enum.Font.GothamBold, Text = "Cancel", TextColor3 = Theme.Text, TextSize = 11, AutoButtonColor = false,
+		BackgroundColor3 = Theme.White, BackgroundTransparency = 0.9, BorderSizePixel = 0, ClipsDescendants = true,
+		Position = UDim2.new(0, 12, 1, -31), Size = UDim2.new(0.5, -18, 0, 22), Name = "CancelButton",
+	}, ExitConfirm)
+	Custom:Corner(CancelButton, 4)
+	Custom:Stroke(CancelButton, Theme.Border, 0.4, 1)
+	local ExitButton = Custom:Create("TextButton", {
+		Font = Enum.Font.GothamBold, Text = "Close", TextColor3 = Theme.White, TextSize = 11, AutoButtonColor = false,
+		BackgroundColor3 = Theme.Red, BorderSizePixel = 0, ClipsDescendants = true,
+		Position = UDim2.new(0.5, 6, 1, -31), Size = UDim2.new(0.5, -18, 0, 22), Name = "ExitButton",
+	}, ExitConfirm)
+	Custom:Corner(ExitButton, 4)
+	ExitButton.MouseEnter:Connect(function() ExitButton.BackgroundColor3 = Theme.Selected end)
+	ExitButton.MouseLeave:Connect(function() ExitButton.BackgroundColor3 = Theme.Off end)
+
+	local ExitBusy = false
+	local function ShowExitConfirm()
+		if ExitBusy then return end
+		ExitBusy = true
+		ExitBackdrop.BackgroundTransparency = 0.55
+		ExitBackdrop.Visible = true
+		ExitConfirm.Visible = true
+	end
+	local function HideExitConfirm()
+		ExitConfirm.Visible = false
+		ExitBackdrop.Visible = false
+		ExitBusy = false
+	end
+
+	local function Cleanup()
+		if Destroyed then return end
+		Destroyed = true
+		Rexxzy_Library.Unloaded = true
+		for _, c in ipairs(Conns) do pcall(function() c:Disconnect() end) end
+		ClearDeveloperTags()
+		for _, t in ipairs(Loops) do pcall(function() t:Cancel() end) end
+		pcall(function() RexxzyGui:Destroy() end)
+	end
+
+	CancelButton.Activated:Connect(function()
+		task.spawn(HideExitConfirm)
+	end)
+	ExitButton.Activated:Connect(function()
+		task.spawn(function()
+			HideExitConfirm()
+			Cleanup()
+		end)
+	end)
+	Close.Activated:Connect(function()
+		ShowExitConfirm()
+	end)
+
+	function Funcs:Destroy() Cleanup() end
+	function Funcs:Toggle() SetOpen(not Opened) end
+	function Funcs:SetOpen(State) SetOpen(State == true) end
+	Funcs.Gui = RexxzyGui
+	function Funcs:SetKeybind(NewKey)
+		if type(NewKey) == "string" then NewKey = Enum.KeyCode[NewKey] end
+		if typeof(NewKey) ~= "EnumItem" or NewKey.EnumType ~= Enum.KeyCode then return false end
+		Keybind = NewKey
+		return true
+	end
+	function Funcs:SetBubblePlatform(Platform)
+		local Value = string.lower(tostring(Platform or "Both"))
+		BubblePlatform = (Value == "mobile" or Value == "mobile only") and "Mobile" or "Both"
+		if not Opened then Bubble.Visible = ShouldShowBubble() end
+		return true
+	end
+	function Funcs:SetToggleButtonPlatform(Platform)
+		return self:SetBubblePlatform(Platform)
+	end
+
+	local Tabs = {}
+	local ActiveTab = nil
+	local TabOrder = 0
+
+	-- Compact data revision: compact row text blocks, inferred icons, refreshable dropdowns, and live data tables.
+-- Generic visual category header. Call it where needed; names such as CORE/TOOLS
+	-- are supplied by the library user and are not built-in navigation entries.
+	function Funcs:AddTabDivider(DividerText)
+		TabOrder = TabOrder + 1
+		local DF = Custom:Create("Frame", {
+			BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = TabOrder, Size = UDim2.new(1, 0, 0, 18),
+			Name = "TabCategoryHeader",
+		}, ScrollTab)
+		Custom:Label(DF, {
+			Font = Enum.Font.GothamBold, Text = string.upper(tostring(DividerText or "")),
+			TextColor3 = Theme.Sub, TextSize = 9,
+			Position = UDim2.new(0, 8, 0, 3), Size = UDim2.new(1, -16, 0, 12), Name = "CategoryLabel",
+		})
+		return DF
+	end
+
+	function Funcs:SelectTab(Target)
+		for i, T in ipairs(Tabs) do
+			if T.Name == Target or i == Target then T.Select() return true end
+		end
+		return false
+	end
+
+	function Funcs:Dialog(DConfig)
+		if Destroyed then return end
+		if type(DConfig) == "string" then DConfig = { Content = DConfig } end
+		DConfig = DConfig or {}
+		local DTitle = tostring(DConfig.Title or DConfig[1] or "Notice")
+		local DText = tostring(DConfig.Content or DConfig[2] or "")
+		local Btns = DConfig.Buttons or DConfig[3]
+		if type(Btns) ~= "table" or #Btns == 0 then Btns = { { "OK" } } end
+		local TSz = TextService:GetTextSize(DText, 11, Enum.Font.Gotham, Vector2.new(206, 1000))
+		local DH = 34 + TSz.Y + 12 + 28 + 12
+
+		local DBackdrop = Custom:Create("TextButton", {
+			Text = "", AutoButtonColor = false, Active = true, BackgroundColor3 = Theme.Black,
+			BackgroundTransparency = 0.55, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0),
+			ZIndex = 59, Name = "DialogBackdrop",
+		}, Main)
+		local DFrame = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.Panel, BorderSizePixel = 0,
+			Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 220, 0, DH), ZIndex = 60, Name = "DialogFrame",
+		}, Main)
+		Custom:Corner(DFrame, 5)
+		Custom:Stroke(DFrame, Theme.Border, 0.35, 1)
+		Custom:Label(DFrame, {
+			Text = DTitle, TextColor3 = Theme.White, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+			Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, -24, 0, 28), Name = "DialogTitle",
+		})
+		Custom:Label(DFrame, {
+			Font = Enum.Font.Gotham, Text = DText, TextColor3 = Theme.Sub, TextSize = 10, TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top,
+			Position = UDim2.new(0, 12, 0, 29), Size = UDim2.new(1, -24, 0, TSz.Y + 2), Name = "DialogText",
+		})
+		local Closing = false
+		local function CloseDialog()
+			if Closing then return end
+			Closing = true
+			DBackdrop:Destroy()
+			DFrame:Destroy()
+		end
+		DBackdrop.Activated:Connect(CloseDialog)
+		local Count = #Btns
+		local Row = Custom:Create("Frame", {
+			BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.new(0, 12, 1, -36),
+			Size = UDim2.new(1, -24, 0, 24), Name = "DialogButtons",
+		}, DFrame)
+		Custom:Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5),
+		}, Row)
+		for i, B in ipairs(Btns) do
+			local BName = tostring(B[1] or B.Name or "OK")
+			local BCallback = B[2] or B.Callback
+			local Danger = B.Danger == true or B[3] == true
+			local Button = Custom:Create("TextButton", {
+				Font = Enum.Font.GothamBold, Text = BName, TextColor3 = Theme.Text, TextSize = 10,
+				AutoButtonColor = false, BackgroundColor3 = Danger and Theme.Off or Theme.Field,
+				BackgroundTransparency = 0, BorderSizePixel = 0, ClipsDescendants = true, LayoutOrder = i,
+				Size = UDim2.new(1 / Count, -math.ceil(5 * (Count - 1) / Count), 0, 24),
+				Name = "DialogButton_" .. BName,
+			}, Row)
+			Custom:Corner(Button, 4)
+			Custom:Stroke(Button, Theme.Border, 0.45, 1)
+			Button.Activated:Connect(function()
+				if BCallback then task.spawn(BCallback) end
+				task.spawn(CloseDialog)
+			end)
+		end
+		return { Close = function() task.spawn(CloseDialog) end }
+	end
+
+	function Funcs:SetScale(NewScale)
+		Base = math.clamp(tonumber(NewScale) or Base, 0.5, 1.5)
+		if MobileLayout then RefreshMobileLayout() end
+		if Opened and not Destroyed then Custom:Tween(WindowScale, 0.2, { Scale = Base }) end
+	end
+
+	function Funcs:SetSize(NewSize)
+		if Destroyed then return false end
+		if typeof(NewSize) == "Vector2" then
+			NewSize = UDim2.fromOffset(NewSize.X, NewSize.Y)
+		end
+		if typeof(NewSize) ~= "UDim2" then return false end
+		DropShadowHolder.Size = NewSize
+		return true
+	end
+
+	function Funcs:GetSize()
+		return DropShadowHolder.Size
+	end
+
+	local ResizeEnabled = Config.Resizable ~= false and Config.Resizeable ~= false
+	local ResizeGrip = Custom:Create("TextButton", {
+		-- Visible stays true so Roblox can hit-test it; all rendered pixels are hidden.
+		Name = "ResizeGrip", Text = "", TextTransparency = 1, AutoButtonColor = false,
+		Selectable = false, Active = true,
+		BackgroundTransparency = 1, BorderSizePixel = 0,
+		AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, 0, 1, 0),
+		Size = UDim2.new(0, 24, 0, 24), ZIndex = 48, Visible = ResizeEnabled,
+	}, Main)
+
+	local Resizing, ResizeStart, ResizeStartSize, ResizeStartPos = false, nil, nil, nil
+	Track(ResizeGrip.InputBegan:Connect(function(Input)
+		if not ResizeEnabled then return end
+		if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+			Resizing = true
+			ResizeStart = Input.Position
+			local Current = DropShadowHolder.Size
+			local ScreenSize = RexxzyGui.AbsoluteSize
+			ResizeStartSize = Vector2.new(
+				Current.X.Scale * ScreenSize.X + Current.X.Offset,
+				Current.Y.Scale * ScreenSize.Y + Current.Y.Offset
+			)
+			ResizeStartPos = DropShadowHolder.Position
+		end
+	end))
+	Track(UserInputService.InputChanged:Connect(function(Input)
+		if not ResizeEnabled or not Resizing or not ResizeStart or not ResizeStartSize or Destroyed then return end
+		if Input.UserInputType ~= Enum.UserInputType.MouseMovement and Input.UserInputType ~= Enum.UserInputType.Touch then return end
+		local Delta = Input.Position - ResizeStart
+		local ScaleNow = math.max(WindowScale.Scale, 0.1)
+		local Screen = RexxzyGui.AbsoluteSize
+		local MaxW = math.max(1, math.floor(Screen.X * 0.94 / ScaleNow))
+		local MaxH = math.max(1, math.floor(Screen.Y * 0.90 / ScaleNow))
+		local MinW, MinH = math.min(360, MaxW), math.min(220, MaxH)
+		local Width = math.clamp(ResizeStartSize.X + Delta.X / ScaleNow, MinW, MaxW)
+		local Height = math.clamp(ResizeStartSize.Y + Delta.Y / ScaleNow, MinH, MaxH)
+		DropShadowHolder.Size = UDim2.fromOffset(math.floor(Width), math.floor(Height))
+		if ResizeStartPos then
+			DropShadowHolder.Position = UDim2.new(
+				ResizeStartPos.X.Scale, ResizeStartPos.X.Offset + (Width - ResizeStartSize.X) * ScaleNow / 2,
+				ResizeStartPos.Y.Scale, ResizeStartPos.Y.Offset + (Height - ResizeStartSize.Y) * ScaleNow / 2
+			)
+		end
+	end))
+	Track(UserInputService.InputEnded:Connect(function(Input)
+		if Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch then
+			Resizing = false
+			ResizeStart = nil
+			ResizeStartSize = nil
+			ResizeStartPos = nil
+		end
+	end))
+
+	function Funcs:SetResizable(State)
+		ResizeEnabled = State ~= false
+		if ResizeGrip then ResizeGrip.Visible = ResizeEnabled end
+		return ResizeEnabled
+	end
+
+	local function ToHSV(C)
+		local R, G, B = C.R, C.G, C.B
+		local Max, Min = math.max(R, G, B), math.min(R, G, B)
+		local D = Max - Min
+		local H = 0
+		if D > 0 then
+			if Max == R then H = ((G - B) / D) % 6
+			elseif Max == G then H = (B - R) / D + 2
+			else H = (R - G) / D + 4 end
+			H = H / 6
+		end
+		return H, Max == 0 and 0 or D / Max, Max
+	end
+	local function FromHSV(H, S, V)
+		H = H % 1
+		local I = math.floor(H * 6)
+		local F = H * 6 - I
+		local P, Q, T = V * (1 - S), V * (1 - F * S), V * (1 - (1 - F) * S)
+		I = I % 6
+		local R, G, B
+		if I == 0 then R, G, B = V, T, P
+		elseif I == 1 then R, G, B = Q, V, P
+		elseif I == 2 then R, G, B = P, V, T
+		elseif I == 3 then R, G, B = P, Q, V
+		elseif I == 4 then R, G, B = T, P, V
+		else R, G, B = V, P, Q end
+		return Color3.new(math.clamp(R, 0, 1), math.clamp(G, 0, 1), math.clamp(B, 0, 1))
+	end
+	local function ToHex(C)
+		return string.format("#%02X%02X%02X", math.floor(C.R * 255 + 0.5), math.floor(C.G * 255 + 0.5), math.floor(C.B * 255 + 0.5))
+	end
+	local function ParseHex(Text)
+		Text = string.gsub(tostring(Text), "%s", "")
+		local Hex = string.match(Text, "^#?(%x%x%x%x%x%x)$")
+		if not Hex then
+			local Short = string.match(Text, "^#?(%x%x%x)$")
+			if Short then
+				Hex = string.gsub(Short, "%x", function(Ch) return Ch .. Ch end)
+			end
+		end
+		if not Hex then return nil end
+		return Color3.fromRGB(tonumber(string.sub(Hex, 1, 2), 16), tonumber(string.sub(Hex, 3, 4), 16), tonumber(string.sub(Hex, 5, 6), 16))
+	end
+	local function AsColor(Value)
+		if typeof(Value) == "Color3" then return Value end
+		if type(Value) == "string" then return ParseHex(Value) end
+		if type(Value) == "table" and #Value >= 3 then
+			return Color3.fromRGB(math.clamp(tonumber(Value[1]) or 0, 0, 255), math.clamp(tonumber(Value[2]) or 0, 0, 255), math.clamp(tonumber(Value[3]) or 0, 0, 255))
+		end
+		return nil
+	end
+
+	local ColorPopup = nil
+	local function BuildColorPopup()
+		if ColorPopup then return ColorPopup end
+		local P = {}
+		local PANEL_W, PANEL_H = 240, 246
+		local Overlay = Custom:Create("TextButton", {
+			Text = "", AutoButtonColor = false, BackgroundColor3 = Theme.Black, BackgroundTransparency = 1, BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 1, 0), ZIndex = 60, Visible = false, Name = "ColorOverlay",
+		}, Main)
+		Custom:Corner(Overlay, 12)
+		local Panel = Custom:Create("Frame", {
+			Active = true, AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.Black, BorderSizePixel = 0,
+			Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, PANEL_W, 0, PANEL_H), ZIndex = 61, Visible = false, Name = "ColorPanel",
+		}, Main)
+		Custom:Corner(Panel, 10)
+		local PanelStroke = Custom:Stroke(Panel, Theme.White, 0.45, 1.2)
+		Custom:AddGradient(PanelStroke, 45, Custom.GradientBorder)
+		local PanelScale = Custom:Create("UIScale", { Scale = 1 }, Panel)
+		local function FitScale()
+			local Avail = SizeUi.Y.Offset > 0 and SizeUi.Y.Offset or 275
+			return math.clamp((Avail - 10) / PANEL_H, 0.55, 1)
+		end
+
+		local TitleLabel = Custom:Label(Panel, {
+			Text = "Color", TextColor3 = Theme.White, TextSize = 12,
+			Position = UDim2.new(0, 12, 0, 8), Size = UDim2.new(1, -44, 0, 16), Name = "PopupTitle",
+		})
+		local CloseBtn = Custom:Create("TextButton", {
+			Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0), BackgroundColor3 = Theme.White,
+			BackgroundTransparency = 0.92, BorderSizePixel = 0, Position = UDim2.new(1, -8, 0, 6), Size = UDim2.new(0, 20, 0, 20),
+			Name = "PopupClose",
+		}, Panel)
+		Custom:Corner(CloseBtn, 6)
+		local CloseIcon = Custom:MakeIcon(CloseBtn, "x", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 13, 0, 13),
+			Color = Theme.Sub, Name = "CloseIcon",
+		})
+		CloseBtn.MouseEnter:Connect(function()
+			Custom:Tween(CloseBtn, 0.12, { BackgroundTransparency = 0.8 })
+			if CloseIcon then CloseIcon.SetColor(Theme.White, true) end
+		end)
+		CloseBtn.MouseLeave:Connect(function()
+			Custom:Tween(CloseBtn, 0.15, { BackgroundTransparency = 0.92 })
+			if CloseIcon then CloseIcon.SetColor(Theme.Sub, true) end
+		end)
+
+		local SVBox = Custom:Create("Frame", {
+			BackgroundColor3 = Color3.new(1, 0, 0), BorderSizePixel = 0, ClipsDescendants = true,
+			Position = UDim2.new(0, 10, 0, 30), Size = UDim2.new(0, 220, 0, 84), Name = "SVBox",
+		}, Panel)
+		Custom:Corner(SVBox, 6)
+		local SatLayer = Custom:Create("Frame", { BackgroundColor3 = Theme.White, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), Name = "Sat" }, SVBox)
+		Custom:Create("UIGradient", {
+			Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) }), Rotation = 0,
+		}, SatLayer)
+		local ValLayer = Custom:Create("Frame", { BackgroundColor3 = Theme.Black, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0), Name = "Val" }, SVBox)
+		Custom:Create("UIGradient", {
+			Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(1, 0) }), Rotation = 90,
+		}, ValLayer)
+		local SVCursor = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+			Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0, 10, 0, 10), ZIndex = 3, Name = "SVCursor",
+		}, SVBox)
+		Custom:Round(SVCursor)
+		Custom:Stroke(SVCursor, Theme.Black, 0.1, 1.5)
+
+		local HueBar = Custom:Create("Frame", {
+			BackgroundColor3 = Theme.White, BorderSizePixel = 0, Position = UDim2.new(0, 10, 0, 120), Size = UDim2.new(0, 220, 0, 10), Name = "HueBar",
+		}, Panel)
+		Custom:Round(HueBar)
+		Custom:Create("UIGradient", {
+			Color = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 0, 0)),
+				ColorSequenceKeypoint.new(0.167, Color3.fromRGB(255, 255, 0)),
+				ColorSequenceKeypoint.new(0.333, Color3.fromRGB(0, 255, 0)),
+				ColorSequenceKeypoint.new(0.5, Color3.fromRGB(0, 255, 255)),
+				ColorSequenceKeypoint.new(0.667, Color3.fromRGB(0, 0, 255)),
+				ColorSequenceKeypoint.new(0.833, Color3.fromRGB(255, 0, 255)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 0, 0)),
+			}), Rotation = 0,
+		}, HueBar)
+		local HueCursor = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+			Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(0, 6, 0, 14), ZIndex = 3, Name = "HueCursor",
+		}, HueBar)
+		Custom:Corner(HueCursor, 3)
+		Custom:Stroke(HueCursor, Theme.Black, 0.1, 1.5)
+
+		local function MakeField(Props, Placeholder)
+			local Box = Custom:Create("TextBox", {
+				Font = Enum.Font.GothamBold, Text = "", PlaceholderText = Placeholder, PlaceholderColor3 = Theme.Sub,
+				TextColor3 = Theme.Text, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Center, ClearTextOnFocus = false,
+				BackgroundColor3 = Theme.Field, BorderSizePixel = 0, ClipsDescendants = true,
+				Position = Props.Position, Size = Props.Size, Name = Props.Name,
+			}, Panel)
+			Custom:Corner(Box, 6)
+			local St = Custom:Stroke(Box, Theme.White, 0.88, 1)
+			Box.Focused:Connect(function() Custom:Tween(St, 0.15, { Transparency = 0.3 }) end)
+			Box.FocusLost:Connect(function() Custom:Tween(St, 0.2, { Transparency = 0.88 }) end)
+			return Box
+		end
+		local HexBox = MakeField({ Position = UDim2.new(0, 10, 0, 138), Size = UDim2.new(0, 84, 0, 22), Name = "HexBox" }, "#FFFFFF")
+		local Preview = Custom:Create("Frame", {
+			BackgroundColor3 = Theme.White, BorderSizePixel = 0, ClipsDescendants = true,
+			Position = UDim2.new(0, 100, 0, 138), Size = UDim2.new(0, 130, 0, 22), Name = "Preview",
+		}, Panel)
+		Custom:Corner(Preview, 6)
+		Custom:Stroke(Preview, Theme.White, 0.7, 1)
+		local OldSwatch = Custom:Create("Frame", { BackgroundColor3 = Theme.White, BorderSizePixel = 0, Size = UDim2.new(0.5, 0, 1, 0), Name = "Old" }, Preview)
+		local NewSwatch = Custom:Create("Frame", {
+			BackgroundColor3 = Theme.White, BorderSizePixel = 0, Position = UDim2.new(0.5, 0, 0, 0), Size = UDim2.new(0.5, 0, 1, 0), Name = "New",
+		}, Preview)
+		local RGBBoxes = {}
+		for I, Letter in ipairs({ "R", "G", "B" }) do
+			RGBBoxes[I] = MakeField({ Position = UDim2.new(0, 10 + (I - 1) * 74, 0, 166), Size = UDim2.new(0, 72, 0, 22), Name = Letter .. "Box" }, Letter)
+		end
+
+		local Presets = {
+			Color3.fromRGB(255, 255, 255), Color3.fromRGB(255, 255, 255), Color3.fromRGB(235, 64, 52), Color3.fromRGB(255, 159, 28),
+			Color3.fromRGB(250, 222, 60), Color3.fromRGB(60, 200, 110), Color3.fromRGB(50, 190, 230), Color3.fromRGB(70, 110, 255),
+		}
+		local PresetButtons = {}
+		for I, PC in ipairs(Presets) do
+			local PB = Custom:Create("TextButton", {
+				Text = "", AutoButtonColor = false, BackgroundColor3 = PC, BorderSizePixel = 0,
+				Position = UDim2.new(0, 10 + (I - 1) * 28, 0, 194), Size = UDim2.new(0, 24, 0, 16), Name = "Preset" .. I,
+			}, Panel)
+			Custom:Corner(PB, 5)
+			Custom:Stroke(PB, Theme.White, 0.75, 1)
+			PresetButtons[I] = PB
+		end
+
+		local function MakeAction(Text, X, Primary)
+			local B = Custom:Create("TextButton", {
+				Font = Enum.Font.GothamBold, Text = Text, TextColor3 = Primary and Theme.Black or Theme.Text, TextSize = 11,
+				AutoButtonColor = false, BackgroundColor3 = Theme.White, BackgroundTransparency = Primary and 0.05 or 0.9,
+				BorderSizePixel = 0, ClipsDescendants = true, Position = UDim2.new(0, X, 0, 216), Size = UDim2.new(0, 106, 0, 22),
+				Name = Text .. "Btn",
+			}, Panel)
+			Custom:Corner(B, 6)
+			B.MouseEnter:Connect(function() Custom:Tween(B, 0.12, { BackgroundTransparency = Primary and 0.15 or 0.8 }) end)
+			B.MouseLeave:Connect(function() Custom:Tween(B, 0.15, { BackgroundTransparency = Primary and 0.05 or 0.9 }) end)
+			return B
+		end
+		local CancelBtn = MakeAction("Cancel", 10, false)
+		local DoneBtn = MakeAction("Done", 124, true)
+
+		local H, S, V = 0, 0, 1
+		local Old, Cur = Theme.White, Theme.White
+		local OnChange, OnDone, OnCancel = nil, nil, nil
+		local Shown = false
+		local Ticket = 0
+		local Drag = nil
+
+		local function Render(SkipText)
+			Cur = FromHSV(H, S, V)
+			SVBox.BackgroundColor3 = FromHSV(H, 1, 1)
+			SVCursor.Position = UDim2.new(S, 0, 1 - V, 0)
+			HueCursor.Position = UDim2.new(H, 0, 0.5, 0)
+			NewSwatch.BackgroundColor3 = Cur
+			if not SkipText then
+				HexBox.Text = ToHex(Cur)
+				RGBBoxes[1].Text = tostring(math.floor(Cur.R * 255 + 0.5))
+				RGBBoxes[2].Text = tostring(math.floor(Cur.G * 255 + 0.5))
+				RGBBoxes[3].Text = tostring(math.floor(Cur.B * 255 + 0.5))
+			end
+		end
+		local function Fire()
+			if OnChange then pcall(OnChange, Cur) end
+		end
+		local function SetColor(C, SkipText)
+			H, S, V = ToHSV(C)
+			Render(SkipText)
+			Fire()
+		end
+
+		local function Hide()
+			if not Shown then return end
+			Shown = false
+			Ticket = Ticket + 1
+			local My = Ticket
+			Drag = nil
+			Custom:Tween(Overlay, 0.18, { BackgroundTransparency = 1 })
+			Custom:Tween(PanelScale, 0.18, { Scale = FitScale() * 0.92 })
+			Custom:Tween(PanelStroke, 0.18, { Transparency = 1 })
+			task.delay(0.19, function()
+				if Ticket == My then
+					Overlay.Visible = false
+					Panel.Visible = false
+				end
+			end)
+		end
+		local function Finish(Apply)
+			local DoneFn, CancelFn = OnDone, OnCancel
+			local Result = Cur
+			if not Apply and Cur ~= Old then
+				Cur = Old
+				if OnChange then pcall(OnChange, Old) end
+				Result = Old
+			end
+			OnChange, OnDone, OnCancel = nil, nil, nil
+			Hide()
+			if Apply and DoneFn then task.spawn(DoneFn, Result) end
+			if not Apply and CancelFn then task.spawn(CancelFn, Result) end
+		end
+
+		DoneBtn.Activated:Connect(function() Finish(true) end)
+		CancelBtn.Activated:Connect(function() Finish(false) end)
+		CloseBtn.Activated:Connect(function() Finish(true) end)
+		Overlay.Activated:Connect(function() Finish(true) end)
+
+		local function IsPointer(Input)
+			return Input.UserInputType == Enum.UserInputType.MouseButton1 or Input.UserInputType == Enum.UserInputType.Touch
+		end
+		local function FromInput(Input)
+			if Drag == "sv" then
+				local Pos, Sz = SVBox.AbsolutePosition, SVBox.AbsoluteSize
+				if Sz.X <= 0 or Sz.Y <= 0 then return end
+				S = math.clamp((Input.Position.X - Pos.X) / Sz.X, 0, 1)
+				V = 1 - math.clamp((Input.Position.Y - Pos.Y) / Sz.Y, 0, 1)
+			elseif Drag == "hue" then
+				local Pos, Sz = HueBar.AbsolutePosition, HueBar.AbsoluteSize
+				if Sz.X <= 0 then return end
+				H = math.clamp((Input.Position.X - Pos.X) / Sz.X, 0, 0.999)
+			else
+				return
+			end
+			Render(false)
+			Fire()
+		end
+		SVBox.InputBegan:Connect(function(Input)
+			if IsPointer(Input) then Drag = "sv" FromInput(Input) end
+		end)
+		HueBar.InputBegan:Connect(function(Input)
+			if IsPointer(Input) then Drag = "hue" FromInput(Input) end
+		end)
+		Track(UserInputService.InputChanged:Connect(function(Input)
+			if Drag and (Input.UserInputType == Enum.UserInputType.MouseMovement or Input.UserInputType == Enum.UserInputType.Touch) then FromInput(Input) end
+		end))
+		Track(UserInputService.InputEnded:Connect(function(Input)
+			if Drag and IsPointer(Input) then Drag = nil end
+		end))
+
+		HexBox.FocusLost:Connect(function()
+			local C = ParseHex(HexBox.Text)
+			if C then SetColor(C, false) else Render(false) end
+		end)
+		for _, Box in ipairs(RGBBoxes) do
+			Box.FocusLost:Connect(function()
+				local R = tonumber(RGBBoxes[1].Text)
+				local G = tonumber(RGBBoxes[2].Text)
+				local B = tonumber(RGBBoxes[3].Text)
+				if R and G and B then
+					SetColor(Color3.fromRGB(math.clamp(math.floor(R), 0, 255), math.clamp(math.floor(G), 0, 255), math.clamp(math.floor(B), 0, 255)), false)
+				else
+					Render(false)
+				end
+			end)
+		end
+		for I, PB in ipairs(PresetButtons) do
+			PB.Activated:Connect(function() SetColor(Presets[I], false) end)
+		end
+
+		function P.Open(Opts)
+			Opts = Opts or {}
+			if Shown then
+				local PrevDone = OnDone
+				OnChange, OnDone, OnCancel = nil, nil, nil
+				if PrevDone then task.spawn(PrevDone, Cur) end
+			end
+			Old = AsColor(Opts.Color) or Theme.White
+			OnChange, OnDone, OnCancel = Opts.OnChange, Opts.OnDone, Opts.OnCancel
+			TitleLabel.Text = tostring(Opts.Title or "Color")
+			OldSwatch.BackgroundColor3 = Old
+			H, S, V = ToHSV(Old)
+			Render(false)
+			Ticket = Ticket + 1
+			Shown = true
+			Overlay.BackgroundTransparency = 1
+			Overlay.Visible = true
+			Panel.Visible = true
+			PanelScale.Scale = FitScale() * 0.9
+			PanelStroke.Transparency = 1
+			Custom:Tween(Overlay, 0.2, { BackgroundTransparency = 0.45 })
+			Custom:Tween(PanelScale, 0.28, { Scale = FitScale() }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			Custom:Tween(PanelStroke, 0.25, { Transparency = 0.45 })
+		end
+		function P.Close(Apply) if Shown then Finish(Apply ~= false) end end
+		function P.IsOpen() return Shown end
+		ColorPopup = P
+		return P
+	end
+
+	function Funcs:ColorPicker(Opts)
+		if type(Opts) ~= "table" then Opts = { Color = Opts } end
+		local Popup = BuildColorPopup()
+		local Cb = Opts.Callback or Opts.OnChange
+		Popup.Open({
+			Title = Opts.Title or Opts.Name, Color = Opts.Color or Opts.Default,
+			OnChange = Cb and function(C) task.spawn(Cb, C) end or nil,
+			OnDone = Opts.OnDone, OnCancel = Opts.OnCancel,
+		})
+	end
+
+	function Funcs:SetIcon(Src) ApplySidebarLogo(Src) end
+	function Funcs:SetBackground(Src, Opts) return ApplyBackground(Src, Opts) end
+	function Funcs:ClearBackground() ApplyBackground(nil) end
+	function Funcs:OpenProfile() OpenProfile() end
+	function Funcs:CloseProfile() CloseProfile() end
+	function Funcs:SetSupportLink(URL, Label) SetProfileSupportLink(URL, Label) end
+	function Funcs:SetBubbleIcon(Src) ApplyBubble(Src) end
+	function Funcs:SetBackgroundTransparency(T)
+		BgImageT = tonumber(T) or BgImageT
+		BgImage.ImageTransparency = BgImageT
+	end
+
+	do
+		
+		local StartBg = Config.Background
+		if StartBg == nil then StartBg = Config.BackgroundImage end
+		if StartBg == nil then StartBg = Config.Wallpaper end
+		if StartBg == nil then
+			StartBg = false
+		end
+		DefaultBackground = StartBg
+		if StartBg ~= nil and StartBg ~= "" and StartBg ~= false then task.defer(ApplyBackground, StartBg) end
+	end
+
+	function Funcs:AddTab(Config)
+		Config = type(Config) == "table" and Config or {}
+		local TabName = Config[1] or Config.Name or Config.Title or "Tab"
+		local TabIcon = Config[2] or Config.Icon or ""
+
+		TabOrder = TabOrder + 1
+		local TabBtn = Custom:Create("TextButton", {
+			Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
+			ClipsDescendants = true, LayoutOrder = TabOrder, Size = UDim2.new(1, 0, 0, 34), Name = TabName .. "TabBtn",
+		}, ScrollTab)
+		Custom:Corner(TabBtn, 7)
+		local TabStroke = Custom:Stroke(TabBtn, Theme.Border, 0.72, 1)
+		TabStroke.Enabled = false
+		local TabFill = Custom:Create("Frame", {
+			BackgroundColor3 = Theme.Selected, BackgroundTransparency = 1, BorderSizePixel = 0,
+			Size = UDim2.new(1, 0, 1, 0), Name = "Fill",
+		}, TabBtn)
+		Custom:Corner(TabFill, 6)
+		local TabIndicator = Custom:Create("Frame", {
+			Name = "Indicator", BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+			Position = UDim2.new(0, 4, 0.5, 0), AnchorPoint = Vector2.new(0, 0.5), Size = UDim2.new(0, 2, 0, 0),
+		}, TabBtn)
+		Custom:Round(TabIndicator)
+		local TabIconImg = Custom:MakeIcon(TabBtn, TabIcon, {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 10, 0.5, 0), Size = UDim2.new(0, 16, 0, 16),
+			Color = Theme.Sub, Name = "TabIcon",
+		})
+		local HasIcon = TabIconImg ~= nil
+		local TabLabel = Custom:Label(TabBtn, {
+			Text = TabName, TextColor3 = Theme.Sub, TextSize = 11, Font = Enum.Font.GothamSemibold,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Position = UDim2.new(0, HasIcon and 34 or 12, 0, 0),
+			Size = UDim2.new(1, HasIcon and -46 or -20, 1, 0), Name = "TabLabel",
+		})
+		local TabActiveDot = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0),
+			Size = UDim2.new(0, 5, 0, 5), BackgroundColor3 = Theme.White,
+			BorderSizePixel = 0, Visible = false, Name = "ActiveDot",
+		}, TabBtn)
+		Custom:Round(TabActiveDot)
+
+		local TabFrame = Custom:Create("ScrollingFrame", {
+			Active = true, BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 1, 0),
+			CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 4,
+			ScrollBarImageColor3 = Theme.White, ScrollBarImageTransparency = 0.6,
+			Name = TabName .. "Frame", Visible = false,
+		}, LayersReal)
+		Custom:Create("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, TabFrame)
+		Custom:Create("UIPadding", { PaddingTop = UDim.new(0, 3), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3) }, TabFrame)
+
+		local TabFuncs = { Frame = TabFrame, Button = TabBtn, Name = TabName }
+
+		TabBtn.MouseEnter:Connect(function()
+			if ActiveTab ~= TabFuncs then
+				Custom:Tween(TabFill, 0.12, { BackgroundTransparency = 0.72 })
+				TabLabel.TextColor3 = Theme.Text
+				TabStroke.Enabled = true
+				TabStroke.Transparency = 0.78
+				if TabIconImg then TabIconImg.SetColor(Theme.Text, true) end
+			end
+		end)
+		TabBtn.MouseLeave:Connect(function()
+			if ActiveTab ~= TabFuncs then
+				Custom:Tween(TabFill, 0.12, { BackgroundTransparency = 1 })
+				TabLabel.TextColor3 = Theme.Sub
+				TabStroke.Enabled = false
+				if TabIconImg then TabIconImg.SetColor(Theme.Sub, true) end
+			end
+		end)
+
+		local function Deactivate(T)
+			T.Frame.Visible = false
+			T.Fill.BackgroundTransparency = 1
+			T.Indicator.Size = UDim2.new(0, 2, 0, 0)
+			T.ActiveDot.Visible = false
+			T.Label.TextColor3 = Theme.Sub
+			T.Stroke.Enabled = false
+			if T.IconImg then T.IconImg.SetColor(Theme.Sub, true) end
+		end
+
+		local function SelectTab()
+			if ActiveTab == TabFuncs then return end
+			if ActiveTab then Deactivate(ActiveTab) end
+			ActiveTab = TabFuncs
+			NameTab.Text = TabName
+			TabFrame.Position = UDim2.new(0, 0, 0, 10)
+			TabFrame.Visible = true
+			Custom:Tween(TabFrame, 0.2, { Position = UDim2.new(0, 0, 0, 0) })
+			Custom:Tween(TabFill, 0.16, { BackgroundTransparency = 0.08 })
+			Custom:Tween(TabIndicator, 0.16, { Size = UDim2.new(0, 2, 0, 0) })
+			TabActiveDot.Visible = true
+			TabStroke.Enabled = true
+			TabStroke.Transparency = 0.84
+			TabLabel.TextColor3 = Theme.White
+			if TabIconImg then TabIconImg.SetColor(Theme.White, true) end
+		end
+
+		TabFuncs.Fill = TabFill
+		TabFuncs.Indicator = TabIndicator
+		TabFuncs.ActiveDot = TabActiveDot
+		TabFuncs.Label = TabLabel
+		TabFuncs.IconImg = TabIconImg
+		TabFuncs.Stroke = TabStroke
+		TabBtn.Activated:Connect(function() CircleClick(TabBtn) SelectTab() end)
+		TabFuncs.Select = SelectTab
+		table.insert(Tabs, TabFuncs)
+		if #Tabs == 1 then SelectTab() end
+
+		function TabFuncs:AddSection(SectionConfig)
+			if type(SectionConfig) == "string" then SectionConfig = { SectionConfig } end
+			local SectionName = SectionConfig[1] or SectionConfig.Name or SectionConfig.Title or "Section"
+
+			-- Section title sits above the content card, matching the reference layout.
+			local SectionFrame = Custom:Create("Frame", {
+				BackgroundTransparency = 1, BorderSizePixel = 0,
+				AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 0),
+				LayoutOrder = #TabFrame:GetChildren(), Name = SectionName .. "Section",
+			}, TabFrame)
+			Custom:Create("UIListLayout", {
+				Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder,
+			}, SectionFrame)
+
+			local Header = Custom:Create("TextButton", {
+				Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
+				LayoutOrder = 1, Size = UDim2.new(1, 0, 0, 18), Name = "Header",
+			}, SectionFrame)
+			local SectionIconName = SectionConfig.Icon
+			if not SectionIconName or SectionIconName == "" then
+				local SectionHint = string.lower(tostring(SectionName) .. " " .. tostring(TabName))
+				local IconRules = {
+					{ "search", "search" }, { "finder", "search" }, { "overview", "grid" },
+					{ "home", "home" }, { "control", "adjustments" }, { "setting", "settings" },
+					{ "config", "settings" }, { "player", "users" }, { "pet", "paw" },
+					{ "event", "calendar" }, { "activity", "activity" }, { "tool", "wrench" },
+					{ "data", "database" }, { "table", "grid" }, { "log", "list" },
+				}
+				for _, Rule in ipairs(IconRules) do
+					if string.find(SectionHint, Rule[1], 1, true) then SectionIconName = Rule[2] break end
+				end
+				SectionIconName = SectionIconName or "layers"
+			end
+			SectionIconName = SectionIconName or "layers"
+			local SectionIcon = Custom:MakeIcon(Header, SectionIconName, {
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 2, 0.5, 0),
+				Size = UDim2.new(0, 13, 0, 13), Color = Theme.White, Name = "SectionIcon",
+			})
+			local HeaderLabel = Custom:Label(Header, {
+				Text = SectionName, TextColor3 = Theme.White, TextSize = 10,
+				Font = Enum.Font.GothamBold, TextTruncate = Enum.TextTruncate.AtEnd,
+				Position = UDim2.new(0, 22, 0, 0), Size = UDim2.new(1, -46, 1, 0), Name = "SectionTitle",
+			})
+			local SecChevron = Custom:Create("Frame", {
+				AnchorPoint = Vector2.new(1, 0.5), BackgroundTransparency = 1, BorderSizePixel = 0,
+				Rotation = 180, Position = UDim2.new(1, -5, 0.5, 0), Size = UDim2.new(0, 12, 0, 12),
+				Name = "SectionArrow",
+			}, Header)
+			for _, Rot in ipairs({ 45, -45 }) do
+				local Arm = Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.Sub, BorderSizePixel = 0,
+					Position = UDim2.new(0.5, Rot == 45 and -2.2 or 2.2, 0.5, -1), Rotation = Rot,
+					Size = UDim2.new(0, 6, 0, 2), Name = "Arm",
+				}, SecChevron)
+				Custom:Round(Arm)
+			end
+
+			local SectionContent = Custom:Create("Frame", {
+				BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0, BorderSizePixel = 0,
+				AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 2,
+				Size = UDim2.new(1, 0, 0, 0), Name = "SectionContent",
+			}, SectionFrame)
+			Custom:Corner(SectionContent, 8)
+			Custom:Stroke(SectionContent, Theme.Border, 0.48, 1)
+			Custom:Create("UIListLayout", {
+				Padding = UDim.new(0, 0), SortOrder = Enum.SortOrder.LayoutOrder,
+			}, SectionContent)
+			Custom:Create("UIPadding", {
+				PaddingLeft = UDim.new(0, 3), PaddingRight = UDim.new(0, 3),
+				PaddingBottom = UDim.new(0, 2), PaddingTop = UDim.new(0, 2),
+			}, SectionContent)
+
+			local SectionOpen = true
+			local function SetSectionOpen(State, Animate)
+				SectionOpen = State and true or false
+				SectionContent.Visible = SectionOpen
+				if Animate then
+					Custom:Tween(SecChevron, 0.2, { Rotation = SectionOpen and 180 or 0 })
+				else
+					SecChevron.Rotation = SectionOpen and 180 or 0
+				end
+			end
+			local function EnsureOpen()
+				if not SectionOpen then SetSectionOpen(true, true) end
+			end
+			Header.Activated:Connect(function() SetSectionOpen(not SectionOpen, true) end)
+			if SectionConfig.Opened == false or SectionConfig.Collapsed == true then SetSectionOpen(false, false) end
+
+			local Order = 0
+			local function Place(Obj)
+				if Order > 0 then
+					Order = Order + 1
+					local Divider = Custom:Create("Frame", {
+						BackgroundColor3 = Theme.White, BackgroundTransparency = 0.88, BorderSizePixel = 0,
+						Size = UDim2.new(1, -18, 0, 1), LayoutOrder = Order, Name = "RowDivider",
+					}, SectionContent)
+				end
+				Order = Order + 1
+				Obj.LayoutOrder = Order
+				return Obj
+			end
+			local Where = SectionName .. " > " .. TabName
+			local SecFuncs = {}
+
+			local function AddLeadingIcon(Parent, Source, PixelSize, IconName)
+				PixelSize = tonumber(PixelSize) or 32
+				local Tile = Custom:Create("Frame", {
+					BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.08, BorderSizePixel = 0,
+					AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0),
+					Size = UDim2.new(0, math.max(20, PixelSize - 10), 0, math.max(20, PixelSize - 10)), Name = "LeadingIconTile",
+				}, Parent)
+				Custom:Corner(Tile, 8)
+				Custom:Stroke(Tile, Theme.Border, 0.4, 1)
+				local IconObj = nil
+				-- AddButton keeps its icon as a direct child for public UI inspection compatibility.
+				if IconName ~= "BtnTileIcon" then
+					IconObj = Custom:MakeIcon(Tile, Source or "circle", {
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+						Size = UDim2.new(0, math.max(10, math.floor(PixelSize * 0.42)), 0, math.max(10, math.floor(PixelSize * 0.42))),
+						Color = Theme.White, Name = IconName or "LeadingIcon",
+					})
+				end
+				return Tile, IconObj
+			end
+
+			function SecFuncs:AddButton(ButtonConfig)
+				local ButtonName = ButtonConfig[1] or ButtonConfig.Name or "Button"
+				local ButtonDesc = ButtonConfig[2] or ButtonConfig.Description or ButtonConfig.Content or ""
+				local Callback = ButtonConfig[3] or ButtonConfig.Callback or function() end
+				if type(ButtonDesc) == "function" then
+					Callback = ButtonDesc
+					ButtonDesc = ""
+				end
+				ButtonDesc = tostring(ButtonDesc)
+				local HasDesc = ButtonDesc ~= ""
+				local Btn, BtnStroke = Custom:Card(SectionContent, HasDesc and 43 or 34, ButtonName .. "Btn", true)
+				Place(Btn)
+				local BtnIconSrc = ButtonConfig.Icon
+				if BtnIconSrc == nil then BtnIconSrc = "mouse-pointer" end
+				local HasLeading = BtnIconSrc ~= false and BtnIconSrc ~= ""
+				local BtnTile
+				if HasLeading then
+					BtnTile = AddLeadingIcon(Btn, BtnIconSrc, 32, "BtnTileIcon")
+				end
+				local BtnLabel = Custom:Label(Btn, {
+					Text = ButtonName, TextTruncate = Enum.TextTruncate.AtEnd, TextSize = 10,
+					Position = UDim2.new(0, HasLeading and 43 or 10, 0, HasDesc and 5 or 0),
+					Size = UDim2.new(1, HasLeading and -55 or -30, 0, 14), Name = "BtnLabel",
+				})
+				if HasDesc then
+					Custom:Label(Btn, {
+						Font = Enum.Font.Gotham, Text = ButtonDesc, TextColor3 = Theme.Sub, TextSize = 9,
+						TextTruncate = Enum.TextTruncate.AtEnd,
+						Position = UDim2.new(0, HasLeading and 43 or 10, 0, 23),
+						Size = UDim2.new(1, HasLeading and -55 or -30, 0, 12), Name = "BtnDesc",
+					})
+				else
+					BtnLabel.Size = UDim2.new(1, HasLeading and -55 or -30, 1, 0)
+				end
+				-- Keep the icon as a direct Btn child so existing icon-inspection code remains compatible.
+				local BtnIconObj = nil
+				if HasLeading then
+					BtnIconObj = Custom:MakeIcon(Btn, BtnIconSrc, {
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 19, 0.5, 0),
+						Size = UDim2.new(0, 14, 0, 14), Color = Theme.White, Name = "BtnIcon",
+					})
+					if BtnIconObj and BtnIconObj.Instance then
+						BtnIconObj.Instance.ZIndex = 3
+						for _, Node in ipairs(BtnIconObj.Instance:GetDescendants()) do
+							if Node:IsA("GuiObject") then Node.ZIndex = 3 end
+						end
+					end
+				end
+				Custom:Hover(Btn, BtnStroke)
+				Btn.Activated:Connect(function() CircleClick(Btn) task.spawn(Callback) end)
+				RegisterSearch(ButtonName, Btn, Where, SelectTab, EnsureOpen, TabFrame)
+				return { Button = Btn, SetText = function(t) BtnLabel.Text = tostring(t) end, SetIcon = function(Src)
+					if BtnIconObj then BtnIconObj.Destroy() BtnIconObj = nil end
+					if BtnTile then BtnTile.Visible = Src ~= nil and Src ~= false and Src ~= "" end
+					if Src and Src ~= "" then
+						if not BtnTile then BtnTile = AddLeadingIcon(Btn, Src, 32, "BtnTileIcon") end
+						BtnIconObj = Custom:MakeIcon(Btn, Src, { AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0, 19, 0.5, 0), Size = UDim2.new(0, 14, 0, 14), Color = Theme.White, Name = "BtnIcon" })
+					end
+				end }
+			end
+
+			function SecFuncs:AddToggle(ToggleConfig)
+				local ToggleName = ToggleConfig[1] or ToggleConfig.Name or "Toggle"
+				local Default = ToggleConfig[2] or ToggleConfig.Default or false
+				local Callback = ToggleConfig[3] or ToggleConfig.Callback or function() end
+				local ToggleDesc = ToggleConfig.Content or ToggleConfig.Description or ToggleConfig[4]
+				local HasDesc = type(ToggleDesc) == "string" and ToggleDesc ~= ""
+				Default = Default and true or false
+				local ToggleFrame, ToggleStroke = Custom:Card(SectionContent, HasDesc and 43 or 34, ToggleName .. "Toggle", true)
+				Place(ToggleFrame)
+				AddLeadingIcon(ToggleFrame, ToggleConfig.Icon or "toggle-right", 32, "ToggleIcon")
+				local ToggleLabel = Custom:Label(ToggleFrame, {
+					Text = ToggleName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, HasDesc and 5 or 0), Size = UDim2.new(1, -112, 0, 14), Name = "ToggleLabel",
+				})
+				if HasDesc then
+					Custom:Label(ToggleFrame, {
+						Font = Enum.Font.Gotham, Text = ToggleDesc, TextColor3 = Theme.Sub, TextSize = 8,
+						TextTruncate = Enum.TextTruncate.AtEnd,
+						Position = UDim2.new(0, 43, 0, 23), Size = UDim2.new(1, -112, 0, 12), Name = "ToggleDesc",
+					})
+				else
+					ToggleLabel.Size = UDim2.new(1, -112, 1, 0)
+				end
+				local SwitchBg = Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(1, 0.5), BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
+					Position = UDim2.new(1, -9, 0.5, 0), Size = UDim2.new(0, 36, 0, 20), Name = "SwitchBg",
+				}, ToggleFrame)
+				Custom:Round(SwitchBg)
+				local SwitchStroke = Custom:Stroke(SwitchBg, Theme.White, 0, 1)
+				local SwitchFill = Custom:Create("Frame", {
+					BackgroundColor3 = Theme.White, BackgroundTransparency = 1, BorderSizePixel = 0,
+					Size = UDim2.new(1, 0, 1, 0), Name = "SwitchFill",
+				}, SwitchBg)
+				Custom:Round(SwitchFill)
+				Custom:AddGradient(SwitchFill, 90)
+				local SwitchDot = Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = Theme.Sub, BorderSizePixel = 0,
+					Position = UDim2.new(0, 4, 0.5, 0), Size = UDim2.new(0, 13, 0, 13), ZIndex = 2, Name = "SwitchDot",
+				}, SwitchBg)
+				Custom:Round(SwitchDot)
+				local ToggleState = Default
+				local function UpdateToggle(State, Animate)
+					ToggleState = State
+					local Fill = State and 0 or 1
+					local Dot = State and UDim2.new(1, -16, 0.5, 0) or UDim2.new(0, 4, 0.5, 0)
+					local DotColor = State and Theme.Black or Theme.Sub
+					local StrokeT = 0
+					if Animate then
+						Custom:Tween(SwitchFill, 0.2, { BackgroundTransparency = Fill })
+						Custom:Tween(SwitchStroke, 0.2, { Transparency = StrokeT })
+						Custom:Tween(SwitchDot, 0.22, { Position = Dot, BackgroundColor3 = DotColor }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+					else
+						SwitchFill.BackgroundTransparency = Fill
+						SwitchStroke.Transparency = StrokeT
+						SwitchDot.Position = Dot
+						SwitchDot.BackgroundColor3 = DotColor
+					end
+				end
+				UpdateToggle(Default, false)
+				Custom:Hover(ToggleFrame, ToggleStroke)
+				ToggleFrame.Activated:Connect(function()
+					CircleClick(ToggleFrame)
+					UpdateToggle(not ToggleState, true)
+					task.spawn(Callback, ToggleState)
+				end)
+				RegisterSearch(ToggleName, ToggleFrame, Where, SelectTab, EnsureOpen, TabFrame)
+				return {
+					Toggle = ToggleFrame,
+					Set = function(State) State = State and true or false UpdateToggle(State, true) task.spawn(Callback, State) end,
+					Get = function() return ToggleState end,
+				}
+			end
+
+			function SecFuncs:AddSlider(SliderConfig)
+				local SliderName = SliderConfig[1] or SliderConfig.Name or "Slider"
+				local MinVal = SliderConfig[2] or SliderConfig.Min or 0
+				local MaxVal = SliderConfig[3] or SliderConfig.Max or 100
+				local Default = SliderConfig[4] or SliderConfig.Default or MinVal
+				local Callback = SliderConfig[5] or SliderConfig.Callback or function() end
+				local Increment = SliderConfig.Increment or 1
+				local Suffix = tostring(SliderConfig.Suffix or "")
+				if Increment <= 0 then Increment = 1 end
+				if MaxVal < MinVal then MinVal, MaxVal = MaxVal, MinVal end
+				local Range = MaxVal - MinVal
+				local Dec = Custom:Decimals(Increment)
+				local Fmt = "%." .. Dec .. "f"
+
+				local function Snap(v)
+					v = math.clamp(v, MinVal, MaxVal)
+					v = MinVal + math.floor((v - MinVal) / Increment + 0.5) * Increment
+					v = math.clamp(v, MinVal, MaxVal)
+					return tonumber(string.format(Fmt, v))
+				end
+				local function ToPercent(v)
+					if Range == 0 then return 0 end
+					return math.clamp((v - MinVal) / Range, 0, 1)
+				end
+
+				local SliderFrame, SliderStroke = Custom:Card(SectionContent, 47, SliderName .. "Slider", false)
+				Place(SliderFrame)
+				AddLeadingIcon(SliderFrame, SliderConfig.Icon or "adjustments", 28, "SliderIcon")
+				Custom:Label(SliderFrame, {
+					Text = SliderName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 5), Size = UDim2.new(1, -105, 0, 13), Name = "SliderLabel",
+				})
+				local CurrentValue = Snap(Default)
+				local ValueLabel = Custom:Label(SliderFrame, {
+					Text = string.format(Fmt, CurrentValue) .. Suffix, TextColor3 = Theme.White, TextXAlignment = Enum.TextXAlignment.Right,
+					Position = UDim2.new(1, -62, 0, 5), Size = UDim2.new(0, 52, 0, 13), Name = "ValueLabel",
+				})
+				local Hit = Custom:Create("TextButton", {
+					Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
+					AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 43, 1, -4), Size = UDim2.new(1, -53, 0, 17), Name = "Hit",
+				}, SliderFrame)
+				local BarBg = Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
+					Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(1, 0, 0, 4), Name = "BarBg",
+				}, Hit)
+				Custom:Round(BarBg)
+				local BarFill = Custom:Create("Frame", {
+					BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+					Size = UDim2.new(ToPercent(CurrentValue), 0, 1, 0), Name = "BarFill",
+				}, BarBg)
+				Custom:Round(BarFill)
+				Custom:AddGradient(BarFill, 0)
+				local SliderDot = Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+					Position = UDim2.new(ToPercent(CurrentValue), 0, 0.5, 0), Size = UDim2.new(0, 11, 0, 11), ZIndex = 2, Name = "SliderDot",
+				}, BarBg)
+				Custom:Round(SliderDot)
+				local DotStroke = Custom:Stroke(SliderDot, Theme.Black, 0.6, 1.5)
+
+				local Dragging = false
+				local function Render(Value, Animate)
+					local Percent = ToPercent(Value)
+					ValueLabel.Text = string.format(Fmt, Value) .. Suffix
+					if Animate then
+						Custom:Tween(BarFill, 0.08, { Size = UDim2.new(Percent, 0, 1, 0) })
+						Custom:Tween(SliderDot, 0.08, { Position = UDim2.new(Percent, 0, 0.5, 0) })
+					else
+						BarFill.Size = UDim2.new(Percent, 0, 1, 0)
+						SliderDot.Position = UDim2.new(Percent, 0, 0.5, 0)
+					end
+				end
+				local function FromInput(Input)
+					local BarX, BarW = BarBg.AbsolutePosition.X, BarBg.AbsoluteSize.X
+					if BarW <= 0 then return end
+					local Percent = math.clamp((Input.Position.X - BarX) / BarW, 0, 1)
+					local New = Snap(MinVal + Range * Percent)
+					Render(New, false)
+					if New ~= CurrentValue then
+						CurrentValue = New
+						task.spawn(Callback, CurrentValue)
+					end
+				end
+				local function SetDragging(State)
+					Dragging = State
+					TabFrame.ScrollingEnabled = not State
+					Custom:Tween(SliderDot, 0.12, { Size = State and UDim2.new(0, 14, 0, 14) or UDim2.new(0, 11, 0, 11) })
+					Custom:Tween(DotStroke, 0.12, { Thickness = State and 2.5 or 1.5 })
+				end
+				Hit.InputBegan:Connect(function(i)
+					if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+						SetDragging(true)
+						FromInput(i)
+					end
+				end)
+				Track(UserInputService.InputChanged:Connect(function(i)
+					if Dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then FromInput(i) end
+				end))
+				Track(UserInputService.InputEnded:Connect(function(i)
+					if Dragging and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then SetDragging(false) end
+				end))
+				Custom:Hover(SliderFrame, SliderStroke)
+				RegisterSearch(SliderName, SliderFrame, Where, SelectTab, EnsureOpen, TabFrame)
+				return {
+					Slider = SliderFrame,
+					Set = function(Value)
+						CurrentValue = Snap(tonumber(Value) or MinVal)
+						Render(CurrentValue, true)
+						task.spawn(Callback, CurrentValue)
+					end,
+					Get = function() return CurrentValue end,
+				}
+			end
+
+			function SecFuncs:AddInput(InputConfig)
+				local InputName = InputConfig[1] or InputConfig.Name or "Input"
+				local Placeholder = InputConfig[2] or InputConfig.Placeholder or "Enter text..."
+				local Default = InputConfig[3] or InputConfig.Default or ""
+				local Callback = InputConfig[4] or InputConfig.Callback or function() end
+				local InputFrame, InputStroke = Custom:Card(SectionContent, 47, InputName .. "Input", false)
+				Place(InputFrame)
+				AddLeadingIcon(InputFrame, InputConfig.Icon or "keyboard", 32, "InputIcon")
+				Custom:Label(InputFrame, {
+					Text = InputName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 4), Size = UDim2.new(1, -55, 0, 12), Name = "InputLabel",
+				})
+				local InputBox = Custom:Create("TextBox", {
+					Font = Enum.Font.Gotham, Text = tostring(Default), PlaceholderText = Placeholder, PlaceholderColor3 = Theme.Sub,
+					TextColor3 = Theme.Text, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
+					BackgroundColor3 = Theme.Field, BorderSizePixel = 0, ClipsDescendants = true,
+					Position = UDim2.new(0, 43, 1, -27), Size = UDim2.new(1, -55, 0, 21), Name = "InputBox",
+				}, InputFrame)
+				Custom:Corner(InputBox, 7)
+				local BoxStroke = Custom:Stroke(InputBox, Theme.White, 0.88, 1)
+				Custom:Create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }, InputBox)
+				if InputConfig.Numeric == true then
+					InputBox:GetPropertyChangedSignal("Text"):Connect(function()
+						local Filtered = string.gsub(InputBox.Text, "[^%d%.%-]", "")
+						if Filtered ~= InputBox.Text then InputBox.Text = Filtered end
+					end)
+				end
+				InputBox.Focused:Connect(function()
+					Custom:Tween(BoxStroke, 0.15, { Transparency = 0.3 })
+					Custom:Tween(InputStroke, 0.15, { Transparency = 0.7 })
+				end)
+				InputBox.FocusLost:Connect(function()
+					Custom:Tween(BoxStroke, 0.2, { Transparency = 0.88 })
+					Custom:Tween(InputStroke, 0.2, { Transparency = 0.92 })
+					task.spawn(Callback, InputBox.Text)
+				end)
+				RegisterSearch(InputName, InputFrame, Where, SelectTab, EnsureOpen, TabFrame)
+				return {
+					Input = InputBox,
+					Set = function(Text) InputBox.Text = tostring(Text) end,
+					Get = function() return InputBox.Text end,
+				}
+			end
+
+			function SecFuncs:AddDropdown(DropdownConfig)
+				local DropdownName = DropdownConfig[1] or DropdownConfig.Name or "Dropdown"
+				local Options = DropdownConfig[2] or DropdownConfig.Options or {}
+				local Default = DropdownConfig[3] or DropdownConfig.Default or nil
+				local Callback = DropdownConfig[4] or DropdownConfig.Callback or function() end
+				local Multi = DropdownConfig.Multi == true or DropdownConfig.Multiple == true or DropdownConfig.MultiSelect == true
+				local MaxSel = tonumber(DropdownConfig.Max)
+				local Deletable = DropdownConfig.Deletable == true
+				local OnDelete = DropdownConfig.OnDelete
+				local ConfirmDelete = DropdownConfig.ConfirmDelete ~= false
+				local DeleteIcon = DropdownConfig.DeleteIcon or "trash"
+				local EmptyText = DropdownConfig.Empty
+				local DataSource = DropdownConfig.DataSource or DropdownConfig.Provider or DropdownConfig.GetOptions
+
+				local HEAD, ROW, MAXLIST, FILTERH = 32, 25, 120, 24
+				local DropdownFrame, DropdownStroke = Custom:Card(SectionContent, HEAD, DropdownName .. "Dropdown", false)
+				Place(DropdownFrame)
+				DropdownFrame.ClipsDescendants = true
+
+				local DropdownBtn = Custom:Create("TextButton", {
+					Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
+					Size = UDim2.new(1, 0, 0, HEAD), Name = "DropdownBtn",
+				}, DropdownFrame)
+				AddLeadingIcon(DropdownBtn, DropdownConfig.Icon or (Multi and "list" or "list"), 28, "DropdownIcon")
+				Custom:Label(DropdownBtn, {
+					Text = DropdownName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 42, 0, 0), Size = UDim2.new(0.5, -42, 1, 0), Name = "DdLabel",
+				})
+				local ValueLabel = Custom:Label(DropdownBtn, {
+					Text = "Select...", TextColor3 = Theme.Sub, TextXAlignment = Enum.TextXAlignment.Right,
+					TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0.5, 0, 0, 0), Size = UDim2.new(0.5, -30, 1, 0), Name = "DdValue",
+				})
+				local ArrowObj = Custom:MakeIcon(DropdownBtn, "chevron-down", {
+					AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -9, 0.5, 0), Size = UDim2.new(0, 15, 0, 15),
+					Color = Theme.White, Name = "Arrow",
+				})
+				local Arrow = ArrowObj.Instance
+
+				local Body = Custom:Create("Frame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, HEAD),
+					Size = UDim2.new(1, 0, 1, -HEAD), Name = "Body",
+				}, DropdownFrame)
+				Custom:Create("Frame", {
+					BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+					Position = UDim2.new(0, 8, 0, 0), Size = UDim2.new(1, -16, 0, 1), Name = "Divider",
+				}, Body)
+
+				local Filterable = #Options > 7 or DropdownConfig.Filter == true or DropdownConfig.Searchable == true
+				local FilterOffset = Filterable and (FILTERH + 4) or 0
+				local FilterBox
+				if Filterable then
+					FilterBox = Custom:Create("TextBox", {
+						Font = Enum.Font.Gotham, Text = "", PlaceholderText = "Filter...", PlaceholderColor3 = Theme.Sub,
+						TextColor3 = Theme.Text, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
+						BackgroundColor3 = Theme.Field, BorderSizePixel = 0, ClipsDescendants = true,
+						Position = UDim2.new(0, 6, 0, 5), Size = UDim2.new(1, -12, 0, FILTERH - 5), Name = "Filter",
+					}, Body)
+					Custom:Round(FilterBox)
+					Custom:Stroke(FilterBox, Theme.White, 0.88, 1)
+					Custom:Create("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, FilterBox)
+				end
+
+				local List = Custom:Create("ScrollingFrame", {
+					Active = true, BackgroundTransparency = 1, BorderSizePixel = 0, CanvasSize = UDim2.new(0, 0, 0, 0),
+					AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 2, ScrollBarImageColor3 = Theme.White,
+					ScrollingDirection = Enum.ScrollingDirection.Y,
+					Position = UDim2.new(0, 4, 0, 6 + FilterOffset), Size = UDim2.new(1, -8, 0, 0), Name = "OptionHolder",
+				}, Body)
+				local ListLayout = Custom:Create("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, List)
+
+				local IsOpen = false
+				local EmptyLabel = nil
+				local Selected = {}
+				local OptionFrames = {}
+				local OptionOrder = {}
+				local OptionValues = {}
+				local OptionValueLookup = {}
+
+				local function Chosen()
+					local Out = {}
+					for _, Name in ipairs(OptionOrder) do
+						if Selected[Name] then
+							local Value = OptionValues[Name]
+							if Value == nil then Value = Name end
+							table.insert(Out, Value)
+						end
+					end
+					return Out
+				end
+
+				local function ChosenLabels()
+					local Out = {}
+					for _, Name in ipairs(OptionOrder) do if Selected[Name] then table.insert(Out, Name) end end
+					return Out
+				end
+
+				local function ListHeight()
+					return math.min(ListLayout.AbsoluteContentSize.Y, MAXLIST)
+				end
+				local function Resize()
+					local LH = ListHeight()
+					List.Size = UDim2.new(1, -8, 0, LH)
+					local Target = HEAD
+					if IsOpen then Target = HEAD + 6 + FilterOffset + LH + 6 end
+					Custom:Tween(DropdownFrame, 0.22, { Size = UDim2.new(1, 0, 0, Target) })
+				end
+				ListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+					if IsOpen then Resize() end
+				end)
+
+				local function Paint(Option, State, Animate)
+					local OF = OptionFrames[Option]
+					if not OF then return end
+					local BG = State and 0.88 or 1
+					local BarSize = State and UDim2.new(0, 3, 0, 12) or UDim2.new(0, 3, 0, 0)
+					local TC = State and Theme.White or Theme.Sub
+					if Animate then
+						Custom:Tween(OF.Frame, 0.18, { BackgroundTransparency = BG })
+						Custom:Tween(OF.Bar, 0.2, { Size = BarSize }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+						Custom:Tween(OF.Label, 0.15, { TextColor3 = TC })
+					else
+						OF.Frame.BackgroundTransparency = BG
+						OF.Bar.Size = BarSize
+						OF.Label.TextColor3 = TC
+					end
+				end
+
+				local function ShowValue()
+					local List2 = ChosenLabels()
+					if #List2 == 0 then
+						ValueLabel.Text = "Select..."
+						ValueLabel.TextColor3 = Theme.Sub
+					else
+						local Text = List2[1]
+						if #List2 == 2 then Text = List2[1] .. ", " .. List2[2]
+						elseif #List2 > 2 then Text = List2[1] .. ", " .. List2[2] .. " +" .. (#List2 - 2) end
+						ValueLabel.Text = Text
+						ValueLabel.TextColor3 = Theme.White
+					end
+				end
+
+				local function Commit(Silent)
+					ShowValue()
+					if not Silent then task.spawn(Callback, Chosen()) end
+				end
+
+				local function ToggleList(State)
+					IsOpen = State
+					Custom:Tween(Arrow, 0.22, { Rotation = State and 180 or 0 })
+					Custom:Tween(DropdownStroke, 0.2, { Transparency = State and 0.6 or 0.92 })
+					Resize()
+				end
+
+				local function SetSelection(Values, Silent)
+					local New = {}
+					local Count = 0
+					for _, Raw in ipairs(Values) do
+						local RawKey = tostring(Raw)
+						local Name = OptionFrames[RawKey] and RawKey or OptionValueLookup[RawKey]
+						if Name and OptionFrames[Name] and not New[Name] then
+							if Multi then
+								if not MaxSel or Count < MaxSel then New[Name] = true Count = Count + 1 end
+							elseif Count == 0 then
+								New[Name] = true Count = 1
+							end
+						end
+					end
+					for Name in pairs(Selected) do
+						if not New[Name] then Paint(Name, false, true) end
+					end
+					for Name in pairs(New) do
+						if not Selected[Name] then Paint(Name, true, true) end
+					end
+					Selected = New
+					Commit(Silent)
+				end
+
+				local function Normalize(Value)
+					if Value == nil then return {} end
+					if type(Value) == "table" then return Value end
+					return { Value }
+				end
+
+				local function OnOptionClick(OptionText)
+					if Multi then
+						if Selected[OptionText] then
+							Selected[OptionText] = nil
+							Paint(OptionText, false, true)
+						else
+							if MaxSel and #Chosen() >= MaxSel then return end
+							Selected[OptionText] = true
+							Paint(OptionText, true, true)
+						end
+						Commit(false)
+					else
+						SetSelection({ OptionText }, false)
+						ToggleList(false)
+					end
+				end
+
+				local function ApplyFilter()
+					local Q = FilterBox and string.lower(FilterBox.Text) or ""
+					for _, Name in ipairs(OptionOrder) do
+						local OF = OptionFrames[Name]
+						if OF then OF.Frame.Visible = Q == "" or string.find(string.lower(Name), Q, 1, true) ~= nil end
+					end
+				end
+				if FilterBox then FilterBox:GetPropertyChangedSignal("Text"):Connect(ApplyFilter) end
+
+				local Build
+				Build = function(NewOptions)
+					for _, OF in pairs(OptionFrames) do OF.Frame:Destroy() end
+					if EmptyLabel then EmptyLabel:Destroy() EmptyLabel = nil end
+					OptionFrames = {}
+					OptionOrder = {}
+					OptionValues = {}
+					OptionValueLookup = {}
+					for i, Raw in ipairs(NewOptions) do
+						local OptionText, OptionValue
+						if type(Raw) == "table" then
+							OptionText = tostring(Raw.Label or Raw.Name or Raw.Text or Raw.Value or Raw.Id or i)
+							OptionValue = Raw.Value
+							if OptionValue == nil then OptionValue = Raw.Id end
+							if OptionValue == nil then OptionValue = Raw.Name end
+							if OptionValue == nil then OptionValue = OptionText end
+						else
+							OptionText = tostring(Raw)
+							OptionValue = Raw
+						end
+						OptionValues[OptionText] = OptionValue
+						OptionValueLookup[tostring(OptionValue)] = OptionText
+						OptionValueLookup[OptionText] = OptionText
+						if not OptionFrames[OptionText] then
+							local OFrame = Custom:Create("TextButton", {
+								Text = "", AutoButtonColor = false, BackgroundColor3 = Theme.White, BackgroundTransparency = 1,
+								BorderSizePixel = 0, ClipsDescendants = true, LayoutOrder = i, Size = UDim2.new(1, 0, 0, ROW),
+								Name = "Option_" .. OptionText,
+							}, List)
+							Custom:Corner(OFrame, 6)
+							local OBar = Custom:Create("Frame", {
+								AnchorPoint = Vector2.new(0, 0.5), BackgroundColor3 = Theme.White, BorderSizePixel = 0,
+								Position = UDim2.new(0, 3, 0.5, 0), Size = UDim2.new(0, 3, 0, 0), Name = "Indicator",
+							}, OFrame)
+							Custom:Round(OBar)
+							local OLabel = Custom:Label(OFrame, {
+								Font = Enum.Font.GothamMedium, Text = OptionText, TextColor3 = Theme.Sub, TextSize = 11,
+								TextTruncate = Enum.TextTruncate.AtEnd,
+								Position = UDim2.new(0, 12, 0, 0), Size = UDim2.new(1, Deletable and -38 or -16, 1, 0), Name = "OptionLabel",
+							})
+							OptionFrames[OptionText] = { Frame = OFrame, Bar = OBar, Label = OLabel }
+							if Deletable then
+								local Del = Custom:Create("TextButton", {
+									Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0.5), BackgroundColor3 = Theme.Red,
+									BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.new(1, -3, 0.5, 0),
+									Size = UDim2.new(0, 18, 0, 18), ZIndex = 3, Name = "DeleteBtn",
+								}, OFrame)
+								Custom:Corner(Del, 5)
+								local DelIcon = Custom:MakeIcon(Del, DeleteIcon, {
+									AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 14, 0, 14),
+									Color = Theme.Sub, ZIndex = 4, Name = "DeleteIcon",
+								})
+								local Armed, ArmTicket = false, 0
+								local function Disarm()
+									Armed = false
+									Custom:Tween(Del, 0.15, { BackgroundTransparency = 1 })
+									if DelIcon then DelIcon.SetColor(Theme.Sub, true) end
+								end
+								Del.MouseEnter:Connect(function()
+									if not Armed then
+										Custom:Tween(Del, 0.12, { BackgroundTransparency = 0.85 })
+										if DelIcon then DelIcon.SetColor(Theme.White, true) end
+									end
+								end)
+								Del.MouseLeave:Connect(function()
+									if not Armed then Disarm() end
+								end)
+								Del.Activated:Connect(function()
+									if ConfirmDelete and not Armed then
+										Armed = true
+										ArmTicket = ArmTicket + 1
+										local My = ArmTicket
+										Custom:Tween(Del, 0.12, { BackgroundTransparency = 0 })
+										if DelIcon then DelIcon.SetColor(Theme.White, true) end
+										task.delay(2.2, function()
+											if Armed and ArmTicket == My and Del.Parent then Disarm() end
+										end)
+										return
+									end
+									local Allowed = true
+									if OnDelete then
+										local Ok, Res = pcall(OnDelete, OptionText)
+										if Ok and Res == false then Allowed = false end
+									end
+									if not Allowed then Disarm() return end
+									local WasSelected = Selected[OptionText]
+									local Left = {}
+									for _, N in ipairs(OptionOrder) do
+										if N ~= OptionText then table.insert(Left, { Label = N, Value = OptionValues[N] }) end
+									end
+									local Pick = {}
+									for N in pairs(Selected) do if N ~= OptionText then table.insert(Pick, N) end end
+									Selected = {}
+									for _, N in ipairs(Pick) do Selected[N] = true end
+									Build(Left)
+									if WasSelected then Commit(false) end
+									if IsOpen then Resize() end
+								end)
+							end
+							table.insert(OptionOrder, OptionText)
+							OFrame.MouseEnter:Connect(function()
+								if not Selected[OptionText] then Custom:Tween(OFrame, 0.12, { BackgroundTransparency = 0.94 }) end
+							end)
+							OFrame.MouseLeave:Connect(function()
+								if not Selected[OptionText] then Custom:Tween(OFrame, 0.15, { BackgroundTransparency = 1 }) end
+							end)
+							OFrame.Activated:Connect(function()
+								CircleClick(OFrame)
+								OnOptionClick(OptionText)
+							end)
+						end
+					end
+					for Name in pairs(Selected) do
+						if OptionFrames[Name] then Paint(Name, true, false) else Selected[Name] = nil end
+					end
+					if #OptionOrder == 0 and EmptyText then
+						EmptyLabel = Custom:Label(List, {
+							Font = Enum.Font.Gotham, Text = tostring(EmptyText), TextColor3 = Theme.Sub, TextSize = 10,
+							TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, 0, 0, ROW), Name = "EmptyLabel",
+						})
+					end
+					ShowValue()
+					ApplyFilter()
+				end
+
+				Build(Options)
+				if Default ~= nil then SetSelection(Normalize(Default), false) end
+
+				DropdownBtn.MouseEnter:Connect(function()
+					if not IsOpen then Custom:Tween(DropdownStroke, 0.15, { Transparency = 0.7 }) end
+				end)
+				DropdownBtn.MouseLeave:Connect(function()
+					if not IsOpen then Custom:Tween(DropdownStroke, 0.2, { Transparency = 0.92 }) end
+				end)
+				DropdownBtn.Activated:Connect(function()
+					CircleClick(DropdownBtn)
+					ToggleList(not IsOpen)
+				end)
+				RegisterSearch(DropdownName, DropdownFrame, Where, SelectTab, EnsureOpen, TabFrame)
+				local DropdownApi
+				DropdownApi = {
+					Dropdown = DropdownFrame,
+					Set = function(Value)
+						local V = Normalize(Value)
+						if #V > 0 then
+							local Any = false
+							for _, x in ipairs(V) do
+								local Key = tostring(x)
+								if OptionFrames[Key] or OptionValueLookup[Key] then Any = true end
+							end
+							if not Any then return end
+						end
+						SetSelection(V, false)
+					end,
+					Get = function() return Chosen() end,
+					Clear = function() SetSelection({}, false) end,
+					Refresh = function(NewOptions, Keep)
+						if type(NewOptions) == "function" then
+							local Ok, Result = pcall(NewOptions)
+							if not Ok or type(Result) ~= "table" then return false end
+							NewOptions = Result
+						end
+						if type(NewOptions) ~= "table" then NewOptions = Options end
+						Options = NewOptions
+						if not Keep then Selected = {} end
+						Build(NewOptions)
+						if IsOpen then Resize() end
+						return true
+					end,
+					SetOptions = function(NewOptions, Keep) return DropdownApi.Refresh(NewOptions, Keep) end,
+					Update = function(NewOptions, Keep) return DropdownApi.Refresh(NewOptions, Keep) end,
+					RefreshFrom = function(Source, Keep)
+						local Result = Source
+						if type(Source) == "function" then
+							local Ok, Value = pcall(Source)
+							if not Ok then return false end
+							Result = Value
+						end
+						if type(Result) ~= "table" then return false end
+						return DropdownApi.Refresh(Result, Keep)
+					end,
+					GetOptions = function() return Options end,
+					Sync = function(Source, Interval, Keep)
+						local Active = true
+						local Connection = { Connected = true }
+						task.spawn(function()
+							while Active and DropdownFrame.Parent do
+								DropdownApi.RefreshFrom(Source, Keep)
+								task.wait(math.max(tonumber(Interval) or 1, 0.25))
+							end
+							Connection.Connected = false
+						end)
+						function Connection:Disconnect() Active = false self.Connected = false end
+						return Connection
+					end,
+					Open = function() ToggleList(true) end,
+					Close = function() ToggleList(false) end,
+				}
+				if type(DataSource) == "function" then
+					DropdownApi.RefreshFrom(DataSource, true)
+					if tonumber(DropdownConfig.RefreshInterval) then
+						DropdownApi.Sync(DataSource, DropdownConfig.RefreshInterval, true)
+					end
+				end
+				return DropdownApi
+			end
+
+			local function CopyComponentConfig(Source)
+				local Out = {}
+				if type(Source) == "table" then for Key, Value in pairs(Source) do Out[Key] = Value end end
+				return Out
+			end
+
+			function SecFuncs:AddMultiDropdown(DropdownConfig)
+				local ConfigCopy = CopyComponentConfig(DropdownConfig)
+				ConfigCopy.Multi = true
+				return SecFuncs:AddDropdown(ConfigCopy)
+			end
+
+			function SecFuncs:AddSearchableDropdown(DropdownConfig)
+				local ConfigCopy = CopyComponentConfig(DropdownConfig)
+				ConfigCopy.Searchable = true
+				ConfigCopy.Filter = true
+				return SecFuncs:AddDropdown(ConfigCopy)
+			end
+
+			function SecFuncs:AddMultiInput(MultiInputConfig)
+				MultiInputConfig = type(MultiInputConfig) == "table" and MultiInputConfig or {}
+				local MultiInputName = MultiInputConfig.Name or MultiInputConfig.Title or "Multi Input"
+				local Fields = MultiInputConfig.Fields or MultiInputConfig.Inputs or {}
+				if type(Fields) ~= "table" then Fields = {} end
+				if #Fields == 0 then
+					warn("[Rexxzy] AddMultiInput requires a non-empty Fields array")
+					return nil
+				end
+				local Callback = type(MultiInputConfig.Callback) == "function" and MultiInputConfig.Callback or function() end
+				local OnChange = type(MultiInputConfig.OnChange) == "function" and MultiInputConfig.OnChange or nil
+				local CallbackOnChange = MultiInputConfig.CallbackOnChange == true
+				local RowHeight = 31
+				local CardHeight = 27 + (#Fields * RowHeight) + 30
+				local InputFrame, InputStroke = Custom:Card(SectionContent, CardHeight, MultiInputName .. "MultiInput", false)
+				Place(InputFrame)
+				InputFrame.ClipsDescendants = true
+				AddLeadingIcon(InputFrame, MultiInputConfig.Icon or "list", 28, "MultiInputIcon")
+				Custom:Label(InputFrame, {
+					Text = MultiInputName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 5), Size = UDim2.new(1, -55, 0, 13), Name = "MultiInputTitle",
+				})
+				local InputObjects = {}
+				local OrderedKeys = {}
+				for Index, Field in ipairs(Fields) do
+					local Spec = type(Field) == "table" and Field or { Name = tostring(Field) }
+					local FieldName = tostring(Spec.Name or Spec.Label or Spec[1] or ("Field " .. Index))
+					local FieldKey = tostring(Spec.Key or FieldName)
+					if InputObjects[FieldKey] then FieldKey = FieldKey .. "_" .. tostring(Index) end
+					local Y = 23 + ((Index - 1) * RowHeight)
+					Custom:Label(InputFrame, {
+						Text = FieldName, TextTruncate = Enum.TextTruncate.AtEnd,
+						TextColor3 = Theme.Sub, TextSize = 9,
+						Position = UDim2.new(0, 43, 0, Y), Size = UDim2.new(0.34, -47, 0, 24), Name = "FieldLabel_" .. Index,
+					})
+					local InputBox = Custom:Create("TextBox", {
+						Font = Enum.Font.Gotham, Text = tostring(Spec.Default or ""),
+						PlaceholderText = tostring(Spec.Placeholder or ("Enter " .. FieldName .. "...")),
+						PlaceholderColor3 = Theme.Sub, TextColor3 = Theme.Text, TextSize = 10,
+						TextXAlignment = Enum.TextXAlignment.Left, ClearTextOnFocus = false,
+						BackgroundColor3 = Theme.Field, BorderSizePixel = 0, ClipsDescendants = true,
+						Position = UDim2.new(0.34, 2, 0, Y + 1), Size = UDim2.new(0.66, -48, 0, 22),
+						Name = "MultiInput_" .. Index,
+					}, InputFrame)
+					Custom:Corner(InputBox, 6)
+					local BoxStroke = Custom:Stroke(InputBox, Theme.White, 0.9, 1)
+					Custom:Create("UIPadding", { PaddingLeft = UDim.new(0, 7), PaddingRight = UDim.new(0, 7) }, InputBox)
+					if Spec.Numeric == true then
+						InputBox:GetPropertyChangedSignal("Text"):Connect(function()
+							local Filtered = string.gsub(InputBox.Text, "[^%d%.%-]", "")
+							if Filtered ~= InputBox.Text then InputBox.Text = Filtered end
+						end)
+					end
+					InputBox.Focused:Connect(function() Custom:Tween(BoxStroke, 0.14, { Transparency = 0.45 }) end)
+					InputBox.FocusLost:Connect(function()
+						Custom:Tween(BoxStroke, 0.16, { Transparency = 0.9 })
+						if CallbackOnChange and OnChange then
+							local Values = {}
+							for Key, Object in pairs(InputObjects) do Values[Key] = Object.Text end
+							Values[FieldKey] = InputBox.Text
+							task.spawn(OnChange, Values, FieldKey, InputBox.Text)
+						end
+					end)
+					InputObjects[FieldKey] = InputBox
+					table.insert(OrderedKeys, FieldKey)
+				end
+				local ApplyButton = Custom:Create("TextButton", {
+					Text = tostring(MultiInputConfig.ApplyText or "APPLY"), Font = Enum.Font.GothamBold,
+					TextColor3 = Theme.Text, TextSize = 9, AutoButtonColor = false,
+					BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.04, BorderSizePixel = 0,
+					Position = UDim2.new(0, 43, 1, -25), Size = UDim2.new(1, -55, 0, 20), Name = "MultiInputApply",
+				}, InputFrame)
+				Custom:Corner(ApplyButton, 6)
+				Custom:Stroke(ApplyButton, Theme.White, 0.88, 1)
+				Custom:Hover(ApplyButton)
+				local function GetValues()
+					local Values = {}
+					for _, Key in ipairs(OrderedKeys) do
+						local Object = InputObjects[Key]
+						Values[Key] = Object and Object.Text or ""
+					end
+					return Values
+				end
+				local function Submit()
+					local Values = GetValues()
+					task.spawn(Callback, Values)
+					return Values
+				end
+				ApplyButton.Activated:Connect(Submit)
+				RegisterSearch(MultiInputName, InputFrame, Where, SelectTab, EnsureOpen, TabFrame)
+				return {
+					Frame = InputFrame, Inputs = InputObjects, Apply = ApplyButton,
+					Get = GetValues, Submit = Submit,
+					Set = function(Values)
+						if type(Values) ~= "table" then return false end
+						for Index, Key in ipairs(OrderedKeys) do
+							local Value = Values[Key]
+							if Value == nil then Value = Values[Index] end
+							if Value ~= nil and InputObjects[Key] then InputObjects[Key].Text = tostring(Value) end
+						end
+						return true
+					end,
+					Clear = function()
+						for _, Object in pairs(InputObjects) do Object.Text = "" end
+					end,
+				}
+			end
+
+			function SecFuncs:AddKeybind(KeybindConfig)
+				local KeybindName = KeybindConfig[1] or KeybindConfig.Name or "Keybind"
+				local DefaultKey = KeybindConfig[2] or KeybindConfig.Default or Enum.KeyCode.E
+				local Callback = KeybindConfig[3] or KeybindConfig.Callback or function() end
+				if type(DefaultKey) == "string" then DefaultKey = Enum.KeyCode[DefaultKey] or Enum.KeyCode.E end
+				local KeybindFrame, KeybindStroke = Custom:Card(SectionContent, 34, KeybindName .. "Keybind", false)
+				Place(KeybindFrame)
+				AddLeadingIcon(KeybindFrame, KeybindConfig.Icon or "keyboard", 28, "KeybindIcon")
+				Custom:Label(KeybindFrame, {
+					Text = KeybindName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 0), Size = UDim2.new(1, -112, 1, 0), Name = "KeybindLabel",
+				})
+				local KeyBtn = Custom:Create("TextButton", {
+					Font = Enum.Font.GothamBold, Text = DefaultKey.Name, TextColor3 = Theme.White, TextSize = 10,
+					AutoButtonColor = false, BackgroundColor3 = Theme.Field, BorderSizePixel = 0, ClipsDescendants = true,
+					AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.new(0, 60, 0, 18), Name = "KeyBtn",
+				}, KeybindFrame)
+				Custom:Corner(KeyBtn, 6)
+				local KeyStroke = Custom:Stroke(KeyBtn, Theme.White, 0.85, 1)
+				local OnPress = KeybindConfig.OnPress or KeybindConfig.Pressed
+				local CurrentKey = DefaultKey
+				local Listening = false
+				local Conn = nil
+				local function Show()
+					KeyBtn.Text = CurrentKey.Name
+					KeyBtn.TextColor3 = Theme.White
+					Custom:Tween(KeyStroke, 0.15, { Transparency = 0.85 })
+				end
+				local function UpdateKey(Key)
+					CurrentKey = Key
+					Show()
+					task.spawn(Callback, Key)
+				end
+				KeyBtn.Activated:Connect(function()
+					if Listening then return end
+					Listening = true
+					KeyBtn.Text = "..."
+					KeyBtn.TextColor3 = Theme.Sub
+					Custom:Tween(KeyStroke, 0.15, { Transparency = 0.2 })
+					Conn = Track(UserInputService.InputBegan:Connect(function(i, gp)
+						if gp then return end
+						if i.UserInputType == Enum.UserInputType.Keyboard then
+							Listening = false
+							if Conn then Conn:Disconnect() Conn = nil end
+							if i.KeyCode == Enum.KeyCode.Escape then Show() else UpdateKey(i.KeyCode) end
+						end
+					end))
+				end)
+				if OnPress then
+					Track(UserInputService.InputBegan:Connect(function(i, gp)
+						if gp or Listening then return end
+						if i.UserInputType == Enum.UserInputType.Keyboard and i.KeyCode == CurrentKey then task.spawn(OnPress, CurrentKey) end
+					end))
+				end
+				Custom:Hover(KeybindFrame, KeybindStroke)
+				RegisterSearch(KeybindName, KeybindFrame, Where, SelectTab, EnsureOpen, TabFrame)
+				return {
+					Keybind = KeybindFrame,
+					Set = function(Key)
+						if type(Key) == "string" then
+							local ok, v = pcall(function() return Enum.KeyCode[Key] end)
+							Key = ok and v or nil
+						end
+						if Key then UpdateKey(Key) end
+					end,
+					Get = function() return CurrentKey end,
+				}
+			end
+
+			local function BuildTextBlock(Config, DefaultTitle, Tag)
+				if type(Config) ~= "table" then Config = { Text = tostring(Config or "") } end
+				if Config[1] and Config[2] then Config = { Title = Config[1], Text = Config[2], Icon = Config.Icon } end
+				local BlockName = Config[1] or Config.Title or DefaultTitle
+				local BlockText = Config[2] or Config.Text or Config.Description or ""
+				local HasBody = tostring(BlockText) ~= ""
+				local RowHeight = HasBody and 42 or 32
+				local Frame = Custom:Card(SectionContent, RowHeight, BlockName .. Tag, false)
+				Place(Frame)
+				Frame.Size = UDim2.new(1, 0, 0, RowHeight)
+				Frame.AutomaticSize = Enum.AutomaticSize.None
+				local TileSize = HasBody and 25 or 23
+				local Tile = Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 7, 0.5, 0),
+					Size = UDim2.new(0, TileSize, 0, TileSize), BackgroundColor3 = Theme.Field,
+					BackgroundTransparency = 0, BorderSizePixel = 0, Name = Tag .. "IconTile",
+				}, Frame)
+				Custom:Corner(Tile, 6)
+				Custom:Stroke(Tile, Theme.Border, 0.45, 1)
+				local IconSource = Config.Icon or (Tag == "ReadMe" and "book-open" or "info")
+				Custom:MakeIcon(Tile, IconSource, {
+					AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+					Size = UDim2.new(0, 13, 0, 13), Color = Theme.Text, Name = Tag .. "Icon",
+				})
+				local TextLeft = TileSize + 16
+				local TitleLabel = Custom:Label(Frame, {
+					Text = tostring(BlockName), TextColor3 = Theme.White, TextSize = 10,
+					Font = Enum.Font.GothamSemibold, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, TextLeft, 0, HasBody and 7 or 0),
+					Size = UDim2.new(1, -TextLeft - 8, 0, 13), Name = "Title",
+				})
+				local Body
+				if HasBody then
+					Body = Custom:Label(Frame, {
+						Font = Enum.Font.Gotham, Text = tostring(BlockText), TextColor3 = Theme.Sub,
+						TextSize = 9, TextTruncate = Enum.TextTruncate.AtEnd,
+						Position = UDim2.new(0, TextLeft, 0, 23),
+						Size = UDim2.new(1, -TextLeft - 8, 0, 12), Name = "Body",
+					})
+				end
+				return Frame, Body, TitleLabel
+			end
+
+			function SecFuncs:AddParagraph(ParagraphConfig)
+				local PF, Body, TitleLabel = BuildTextBlock(ParagraphConfig, "Paragraph", "Paragraph")
+				return {
+					Paragraph = PF,
+					Set = function(Text) if Body then Body.Text = tostring(Text) end end,
+					SetTitle = function(Text) TitleLabel.Text = tostring(Text) end,
+					SetText = function(Text)
+						Text = tostring(Text or "")
+						if not Body and Text ~= "" then
+							Body = Custom:Label(PF, { Font = Enum.Font.Gotham, Text = Text, TextColor3 = Theme.Sub, TextSize = 9,
+								TextTruncate = Enum.TextTruncate.AtEnd, Position = UDim2.new(0, 48, 0, 23), Size = UDim2.new(1, -56, 0, 12), Name = "Body" })
+							PF.Size = UDim2.new(1, 0, 0, 42)
+						elseif Body then Body.Text = Text end
+					end,
+				}
+			end
+
+			function SecFuncs:AddReadMe(ReadMeConfig)
+				local RF = BuildTextBlock(ReadMeConfig, "Read Me", "ReadMe")
+				return { ReadMe = RF }
+			end
+
+			function SecFuncs:AddSeparator(SeparatorConfig)
+				if type(SeparatorConfig) == "string" then SeparatorConfig = { SeparatorConfig } end
+				local SeparatorName = SeparatorConfig and (SeparatorConfig[1] or SeparatorConfig.Name) or ""
+				local SF = Custom:Create("Frame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 12), Name = "Separator",
+				}, SectionContent)
+				Place(SF)
+				if SeparatorName ~= "" then
+					local Lbl = Custom:Label(SF, {
+						Text = SeparatorName, TextColor3 = Theme.Sub, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Center,
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+						AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 1, 0), Name = "SepLabel",
+					})
+					local Half = Lbl.TextBounds.X / 2 + 8
+					for _, Dir in ipairs({ -1, 1 }) do
+						Custom:Create("Frame", {
+							BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+							AnchorPoint = Vector2.new(Dir == -1 and 1 or 0, 0.5),
+							Position = UDim2.new(0.5, Dir * Half, 0.5, 0), Size = UDim2.new(0.5, -Half, 0, 1), Name = "SepLine",
+						}, SF)
+					end
+				else
+					Custom:Create("Frame", {
+						BackgroundColor3 = Theme.Black, BackgroundTransparency = 0, BorderSizePixel = 0,
+						AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 0, 0.5, 0), Size = UDim2.new(1, 0, 0, 1), Name = "SepLine",
+					}, SF)
+				end
+				return { Separator = SF }
+			end
+
+			function SecFuncs:AddLine()
+				local LF = Custom:Create("Frame", {
+					BackgroundColor3 = Theme.White, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 1), Name = "Line",
+				}, SectionContent)
+				Place(LF)
+				Custom:Create("UIGradient", {
+					Color = Custom.GradientWhite,
+					Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1), NumberSequenceKeypoint.new(0.5, 0.5), NumberSequenceKeypoint.new(1, 1) }),
+				}, LF)
+				return { Line = LF }
+			end
+
+			function SecFuncs:AddTable(TableConfig)
+				TableConfig = type(TableConfig) == "table" and TableConfig or {}
+				local TableName = tostring(TableConfig.Name or TableConfig.Title or "Table")
+				local Columns = TableConfig.Columns or TableConfig.Headers or {}
+				local Data = TableConfig.Data or TableConfig.Rows or {}
+				if type(Columns) ~= "table" then Columns = {} end
+				if type(Data) ~= "table" then Data = {} end
+				local DataSource = TableConfig.DataSource or TableConfig.Provider or TableConfig.GetData
+				local RowHeight = math.clamp(tonumber(TableConfig.RowHeight) or 24, 20, 34)
+				local HeaderHeight = 25
+				local MaxRows = math.clamp(math.floor(tonumber(TableConfig.MaxVisibleRows) or 5), 1, 12)
+				local TableFrame = Custom:Card(SectionContent, HeaderHeight + RowHeight * math.max(1, math.min(#Data, MaxRows)) + 6, TableName .. "Table", false)
+				Place(TableFrame)
+				TableFrame.ClipsDescendants = true
+				local Header = Custom:Create("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, HeaderHeight), Name = "TableHeader" }, TableFrame)
+				local TableIcon = Custom:MakeIcon(Header, TableConfig.Icon or "grid", {
+					AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0),
+					Size = UDim2.new(0, 13, 0, 13), Color = Theme.Text, Name = "TableIcon",
+				})
+				Custom:Label(Header, { Text = TableName, TextColor3 = Theme.Text, TextSize = 10,
+					Position = UDim2.new(0, 28, 0, 0), Size = UDim2.new(1, -62, 1, 0), Name = "TableTitle" })
+				local RefreshButton = Custom:Create("TextButton", { Text = "", AutoButtonColor = false,
+					BackgroundTransparency = 1, BorderSizePixel = 0, AnchorPoint = Vector2.new(1, 0.5),
+					Position = UDim2.new(1, -7, 0.5, 0), Size = UDim2.new(0, 22, 0, 22), Name = "TableRefreshButton" }, Header)
+				Custom:MakeIcon(RefreshButton, "refresh-cw", { AnchorPoint = Vector2.new(0.5, 0.5),
+					Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 12, 0, 12), Color = Theme.Sub, Name = "RefreshIcon" })
+				local View = Custom:Create("ScrollingFrame", { Active = true, BackgroundTransparency = 1, BorderSizePixel = 0,
+					Position = UDim2.new(0, 4, 0, HeaderHeight), Size = UDim2.new(1, -8, 0, RowHeight * math.max(1, math.min(#Data, MaxRows))),
+					CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+					ScrollBarThickness = 2, ScrollBarImageColor3 = Theme.White, ScrollingDirection = Enum.ScrollingDirection.Y, Name = "TableRows" }, TableFrame)
+				local RowsLayout = Custom:Create("UIListLayout", { Padding = UDim.new(0, 1), SortOrder = Enum.SortOrder.LayoutOrder }, View)
+				local EmptyLabel
+				local RowFrames = {}
+				local function ResolveColumns(Rows)
+					if #Columns > 0 then return Columns end
+					local First = Rows[1]
+					local Out = {}
+					if type(First) == "table" then
+						if #First > 0 then for I = 1, #First do table.insert(Out, "Column " .. I) end
+						else
+							local Keys = {}
+							for K in pairs(First) do table.insert(Keys, tostring(K)) end
+							table.sort(Keys)
+							for _, K in ipairs(Keys) do table.insert(Out, K) end
+						end
+					else
+						Out = { "Value" }
+					end
+					return Out
+				end
+				local function ColumnName(Column, Index)
+					if type(Column) == "table" then return tostring(Column.Name or Column.Label or Column.Key or ("Column " .. Index)) end
+					return tostring(Column)
+				end
+				local function CellValue(Row, Column, Index)
+					if type(Row) ~= "table" then return Index == 1 and tostring(Row) or "" end
+					local Key = type(Column) == "table" and (Column.Key or Column.Name or Column.Label) or Column
+					local Value = Row[Key]
+					if Value == nil then Value = Row[Index] end
+					return Value == nil and "" or tostring(Value)
+				end
+				local function ClearRows()
+					for _, Row in ipairs(RowFrames) do if Row and Row.Parent then Row:Destroy() end end
+					RowFrames = {}
+					if EmptyLabel then EmptyLabel:Destroy() EmptyLabel = nil end
+				end
+				local function BuildRows(NewData)
+					Data = type(NewData) == "table" and NewData or {}
+					ClearRows()
+					local ActiveColumns = ResolveColumns(Data)
+					local Count = math.max(1, #ActiveColumns)
+					local Widths = type(TableConfig.Widths) == "table" and TableConfig.Widths or {}
+					local HeaderRow = Custom:Create("Frame", { BackgroundColor3 = Theme.Field, BackgroundTransparency = 0.15,
+						BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, RowHeight), LayoutOrder = 1, Name = "ColumnHeaders" }, View)
+					Custom:Corner(HeaderRow, 4)
+					table.insert(RowFrames, HeaderRow)
+					local function WidthAt(I)
+						local W = tonumber(Widths[I])
+						return W and W > 0 and W <= 1 and W or (1 / Count)
+					end
+					local function MakeCells(Parent, Row, IsHeader, Order)
+						local Offset = 0
+						for I, Column in ipairs(ActiveColumns) do
+							local W = WidthAt(I)
+							local Value = IsHeader and ColumnName(Column, I) or CellValue(Row, Column, I)
+							Custom:Label(Parent, { Text = Value, TextColor3 = IsHeader and Theme.Text or Theme.Sub,
+								Font = IsHeader and Enum.Font.GothamSemibold or Enum.Font.Gotham, TextSize = 9,
+								TextTruncate = Enum.TextTruncate.AtEnd, Position = UDim2.new(Offset, 5, 0, 0),
+								Size = UDim2.new(W, -8, 1, 0), Name = "Cell_" .. I })
+							Offset = Offset + W
+						end
+					end
+					MakeCells(HeaderRow, nil, true, 1)
+					for I, Row in ipairs(Data) do
+						local RowButton = Custom:Create("TextButton", { Text = "", AutoButtonColor = false,
+							BackgroundColor3 = Theme.Panel, BackgroundTransparency = 0, BorderSizePixel = 0,
+							Size = UDim2.new(1, 0, 0, RowHeight), LayoutOrder = I + 1, Name = "DataRow_" .. I }, View)
+						if I % 2 == 0 then RowButton.BackgroundColor3 = Theme.Field end
+						MakeCells(RowButton, Row, false, I)
+						table.insert(RowFrames, RowButton)
+						if type(TableConfig.OnRowClick) == "function" then
+							RowButton.Activated:Connect(function() pcall(TableConfig.OnRowClick, Row, I) end)
+						end
+					end
+					if #Data == 0 then
+						EmptyLabel = Custom:Label(View, { Text = tostring(TableConfig.Empty or "No data"), TextColor3 = Theme.Sub,
+							TextSize = 9, TextXAlignment = Enum.TextXAlignment.Center, Size = UDim2.new(1, 0, 0, RowHeight), Name = "EmptyLabel" })
+					end
+					local VisibleRows = math.max(1, math.min(#Data, MaxRows))
+					View.Size = UDim2.new(1, -8, 0, VisibleRows * RowHeight + math.min(#Data, MaxRows))
+					TableFrame.Size = UDim2.new(1, 0, 0, HeaderHeight + VisibleRows * RowHeight + math.min(#Data, MaxRows) + 4)
+				end
+				BuildRows(Data)
+				local TableApi
+				TableApi = {
+					Frame = TableFrame, Table = TableFrame,
+					Refresh = function(NewData)
+						if type(NewData) == "function" then local Ok, Result = pcall(NewData); if not Ok then return false end; NewData = Result end
+						if type(NewData) ~= "table" then return false end
+						BuildRows(NewData)
+						return true
+					end,
+					SetData = function(NewData) return TableApi.Refresh(NewData) end,
+					Update = function(NewData) return TableApi.Refresh(NewData) end,
+					RefreshFrom = function(Source) return TableApi.Refresh(Source) end,
+					GetData = function() return Data end,
+					Sync = function(Source, Interval)
+						local Active = true
+						local Connection = { Connected = true }
+						task.spawn(function()
+							while Active and TableFrame.Parent do
+								TableApi.Refresh(Source)
+								task.wait(math.max(tonumber(Interval) or 1, 0.25))
+							end
+							Connection.Connected = false
+						end)
+						function Connection:Disconnect() Active = false self.Connected = false end
+						return Connection
+					end,
+				}
+				RefreshButton.Activated:Connect(function() TableApi.Refresh(type(DataSource) == "function" and DataSource or Data) end)
+				if type(DataSource) == "function" then
+					TableApi.Refresh(DataSource)
+					if tonumber(TableConfig.RefreshInterval) then TableApi.Sync(DataSource, TableConfig.RefreshInterval) end
+				end
+				return TableApi
+			end
+
+			SecFuncs.AddDataTable = SecFuncs.AddTable
+
+			function SecFuncs:AddSocial(SocialConfig)
+				local SocialName = SocialConfig[1] or SocialConfig.Name or "Social"
+				local SocialUrl = SocialConfig[2] or SocialConfig.Url or ""
+				local SocialIcon = SocialConfig[3] or SocialConfig.Icon or ""
+				local SF, SStroke = Custom:Card(SectionContent, 40, SocialName .. "Social", true)
+				Place(SF)
+				AddLeadingIcon(SF, SocialIcon ~= "" and SocialIcon or "external-link", 28, "SocialIcon")
+				Custom:Label(SF, {
+					Text = SocialName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 0), Size = UDim2.new(1, -58, 1, 0), Name = "SocialLabel",
+				})
+				Custom:Hover(SF, SStroke)
+				SF.Activated:Connect(function()
+					CircleClick(SF)
+					if SocialUrl == "" then return end
+					local ok = pcall(function() game:GetService("GuiService"):OpenBrowserWindow(SocialUrl) end)
+					if not ok and setclipboard then
+						pcall(setclipboard, SocialUrl)
+						Rexxzy_Library:SetNotification({ Content = "Link copied: " .. SocialUrl })
+					end
+				end)
+				RegisterSearch(SocialName, SF, Where, SelectTab, EnsureOpen, TabFrame)
+				return { Social = SF }
+			end
+
+			function SecFuncs:AddCopyGroup(CopyConfig)
+				local CopyName = CopyConfig[1] or CopyConfig.Name or "Copy Group"
+				local CopyText = CopyConfig[2] or CopyConfig.Text or ""
+				local CF, CStroke = Custom:Card(SectionContent, 40, CopyName .. "Copy", false)
+				Place(CF)
+				AddLeadingIcon(CF, CopyConfig.Icon or "copy", 28, "CopyIcon")
+				Custom:Label(CF, {
+					Text = CopyName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 0), Size = UDim2.new(1, -112, 1, 0), Name = "CopyLabel",
+				})
+				local CopyBtn = Custom:Create("TextButton", {
+					Font = Enum.Font.GothamBold, Text = "Copy", TextColor3 = Theme.White, TextSize = 10, AutoButtonColor = false,
+					BackgroundColor3 = Theme.Field, BorderSizePixel = 0, ClipsDescendants = true,
+					AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.new(0, 48, 0, 18), Name = "CopyBtn",
+				}, CF)
+				Custom:Corner(CopyBtn, 6)
+				local CopyStroke = Custom:Stroke(CopyBtn, Theme.White, 0.85, 1)
+				CopyBtn.MouseEnter:Connect(function() Custom:Tween(CopyStroke, 0.15, { Transparency = 0.4 }) end)
+				CopyBtn.MouseLeave:Connect(function() Custom:Tween(CopyStroke, 0.2, { Transparency = 0.85 }) end)
+				CopyBtn.Activated:Connect(function()
+					CircleClick(CopyBtn)
+					if setclipboard then
+						pcall(setclipboard, CopyText)
+						Rexxzy_Library:SetNotification({ Content = "Copied: " .. CopyText })
+					else
+						Rexxzy_Library:SetNotification({ Content = "Clipboard is not supported by your executor" })
+					end
+				end)
+				Custom:Hover(CF, CStroke)
+				RegisterSearch(CopyName, CF, Where, SelectTab, EnsureOpen, TabFrame)
+				return { CopyGroup = CF, Set = function(Text) CopyText = tostring(Text) end }
+			end
+
+			function SecFuncs:AddColorPicker(CPConfig)
+				local CPName = CPConfig[1] or CPConfig.Name or "Color"
+				local Default = AsColor(CPConfig[2] or CPConfig.Default) or Color3.fromRGB(255, 255, 255)
+				local Callback = CPConfig[3] or CPConfig.Callback or function() end
+				local CPFrame, CPStroke = Custom:Card(SectionContent, 40, CPName .. "ColorPicker", true)
+				Place(CPFrame)
+				AddLeadingIcon(CPFrame, CPConfig.Icon or "palette", 28, "ColorPickerIcon")
+				Custom:Label(CPFrame, {
+					Text = CPName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 0), Size = UDim2.new(1, -150, 1, 0), Name = "ColorLabel",
+				})
+				local Swatch = Custom:Create("Frame", {
+					AnchorPoint = Vector2.new(1, 0.5), BackgroundColor3 = Default, BorderSizePixel = 0,
+					Position = UDim2.new(1, -9, 0.5, 0), Size = UDim2.new(0, 30, 0, 15), Name = "Swatch",
+				}, CPFrame)
+				Custom:Corner(Swatch, 5)
+				Custom:Stroke(Swatch, Theme.White, 0.6, 1)
+				local HexText = Custom:Label(CPFrame, {
+					Font = Enum.Font.GothamMedium, Text = ToHex(Default), TextColor3 = Theme.Sub, TextSize = 10,
+					TextXAlignment = Enum.TextXAlignment.Right, AnchorPoint = Vector2.new(1, 0.5),
+					Position = UDim2.new(1, -46, 0.5, 0), Size = UDim2.new(0, 60, 1, 0), Name = "ColorHex",
+				})
+				local Current = Default
+				local function Paint(C)
+					Current = C
+					Swatch.BackgroundColor3 = C
+					HexText.Text = ToHex(C)
+				end
+				local Editing = false
+				local function Open()
+					Editing = true
+					BuildColorPopup().Open({
+						Title = CPName, Color = Current,
+						OnChange = function(C)
+							Paint(C)
+							task.spawn(Callback, C)
+						end,
+						OnDone = function() Editing = false end,
+						OnCancel = function() Editing = false end,
+					})
+				end
+				CPFrame.Activated:Connect(function()
+					CircleClick(CPFrame)
+					Open()
+				end)
+				Custom:Hover(CPFrame, CPStroke)
+				RegisterSearch(CPName, CPFrame, Where, SelectTab, EnsureOpen, TabFrame)
+				return {
+					ColorPicker = CPFrame,
+					Set = function(Value)
+						local C = AsColor(Value)
+						if C then
+							Paint(C)
+							task.spawn(Callback, C)
+						end
+					end,
+					Get = function() return Current end,
+					Open = Open,
+					Close = function() if Editing and ColorPopup then ColorPopup.Close(true) end end,
+				}
+			end
+
+			function SecFuncs:AddLabel(LabelConfig)
+				
+				local Cfg = {}
+				if type(LabelConfig) == "string" or type(LabelConfig) == "number" then
+					Cfg.Text = LabelConfig
+				elseif type(LabelConfig) == "table" then
+					for k, v in pairs(LabelConfig) do Cfg[k] = v end
+					if Cfg[1] ~= nil and Cfg.Text == nil and Cfg.Name == nil then Cfg.Text = Cfg[1] end
+					if Cfg[2] ~= nil and Cfg.Description == nil and Cfg.Content == nil then Cfg.Description = Cfg[2] end
+				end
+
+				local function Sanitize(v)
+					if type(v) ~= "string" and type(v) ~= "number" then return nil end
+					local s = tostring(v)
+					
+					if s:match("^table:%s*0x[%da-fA-F]+$") then return nil end
+					return s
+				end
+
+				local LabelText = Sanitize(Cfg.Text or Cfg.Name or Cfg.Title) or ""
+				local DescText = Sanitize(Cfg.Description or Cfg.Content or Cfg.Sub) or ""
+				local TextColor = typeof(Cfg.Color) == "Color3" and Cfg.Color or (typeof(Cfg.TextColor3) == "Color3" and Cfg.TextColor3 or Theme.Text)
+				local DescColor = typeof(Cfg.DescColor) == "Color3" and Cfg.DescColor or Theme.Sub
+				local TextSize = math.clamp(tonumber(Cfg.TextSize or Cfg.Size) or 11, 8, 28)
+				local DescSize = math.clamp(tonumber(Cfg.DescSize) or 10, 8, 22)
+				local FontFace = typeof(Cfg.Font) == "EnumItem" and Cfg.Font or Enum.Font.GothamMedium
+				local Align = Enum.TextXAlignment.Left
+				do
+					local a = string.lower(tostring(Cfg.Align or Cfg.TextXAlignment or "left"))
+					if a == "center" or a == "middle" then Align = Enum.TextXAlignment.Center
+					elseif a == "right" then Align = Enum.TextXAlignment.Right end
+				end
+				local Rich = Cfg.RichText == true
+				local IconSrc = Cfg.Icon
+				local Clickable = type(Cfg.Callback) == "function" or Cfg.Clickable == true
+				local Callback = type(Cfg.Callback) == "function" and Cfg.Callback or function() end
+				local CardH = (DescText ~= "" and 46) or 36
+
+				local LF, LStroke = Custom:Card(SectionContent, CardH, "Label", Clickable)
+				Place(LF)
+				LF.AutomaticSize = Enum.AutomaticSize.Y
+
+				
+				Custom:Create("UIPadding", {
+					PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
+					PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
+				}, LF)
+				local Row = Custom:Create("Frame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, AutomaticSize = Enum.AutomaticSize.Y,
+					Size = UDim2.new(1, 0, 0, 0), Name = "LabelRow",
+				}, LF)
+				Custom:Create("UIListLayout", {
+					FillDirection = Enum.FillDirection.Horizontal,
+					VerticalAlignment = Enum.VerticalAlignment.Center,
+					SortOrder = Enum.SortOrder.LayoutOrder,
+					Padding = UDim.new(0, 8),
+				}, Row)
+
+				local IconObj = nil
+				local IconHold = nil
+				if IconSrc then
+					IconHold = Custom:Create("Frame", {
+						BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 1,
+						Size = UDim2.new(0, 18, 0, 18), Name = "IconHold",
+					}, Row)
+					IconObj = Custom:MakeIcon(IconHold, IconSrc, {
+						Size = UDim2.new(0, 16, 0, 16), Color = TextColor, Name = "LabelIcon",
+						AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+					})
+				end
+
+				local TextCol = Custom:Create("Frame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 2,
+					AutomaticSize = Enum.AutomaticSize.Y,
+					Size = UDim2.new(1, IconSrc and -26 or 0, 0, 0), Name = "TextCol",
+				}, Row)
+				Custom:Create("UIListLayout", {
+					SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2),
+				}, TextCol)
+
+				local Text = Custom:Label(TextCol, {
+					Font = FontFace, Text = LabelText, TextColor3 = TextColor, TextSize = TextSize,
+					TextWrapped = true, TextXAlignment = Align, TextYAlignment = Enum.TextYAlignment.Top,
+					RichText = Rich, AutomaticSize = Enum.AutomaticSize.Y,
+					Size = UDim2.new(1, 0, 0, TextSize + 2), LayoutOrder = 1, Name = "LabelText",
+				})
+				local Desc = nil
+				if DescText ~= "" then
+					Desc = Custom:Label(TextCol, {
+						Font = Enum.Font.Gotham, Text = DescText, TextColor3 = DescColor, TextSize = DescSize,
+						TextWrapped = true, TextXAlignment = Align, TextYAlignment = Enum.TextYAlignment.Top,
+						RichText = Rich, AutomaticSize = Enum.AutomaticSize.Y,
+						Size = UDim2.new(1, 0, 0, DescSize + 2), LayoutOrder = 2, Name = "LabelDesc",
+					})
+				end
+
+				if Clickable then
+					LF.Activated:Connect(function()
+						CircleClick(LF)
+						task.spawn(Callback, Text.Text)
+					end)
+					Custom:Hover(LF, LStroke)
+				end
+
+				local function ApplyText(v)
+					local s = Sanitize(v)
+					if s == nil then return end
+					Text.Text = s
+				end
+				local function ApplyDesc(v)
+					local s = Sanitize(v)
+					if s == nil then
+						if Desc then Desc.Visible = false end
+						return
+					end
+					if not Desc then
+						Desc = Custom:Label(TextCol, {
+							Font = Enum.Font.Gotham, Text = s, TextColor3 = DescColor, TextSize = DescSize,
+							TextWrapped = true, TextXAlignment = Align, TextYAlignment = Enum.TextYAlignment.Top,
+							RichText = Rich, AutomaticSize = Enum.AutomaticSize.Y,
+							Size = UDim2.new(1, 0, 0, DescSize + 2), LayoutOrder = 2, Name = "LabelDesc",
+						})
+					else
+						Desc.Text = s
+						Desc.Visible = true
+					end
+				end
+				local function ApplyColor(c)
+					if typeof(c) ~= "Color3" then return end
+					Text.TextColor3 = c
+					if IconObj and IconObj.Instance then
+						pcall(function() IconObj.Instance.ImageColor3 = c end)
+					end
+				end
+				local function ApplyIcon(src)
+					if not src then
+						if IconHold then IconHold.Visible = false end
+						return
+					end
+					if not IconHold then
+						IconHold = Custom:Create("Frame", {
+							BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 1,
+							Size = UDim2.new(0, 18, 0, 18), Name = "IconHold",
+						}, Row)
+					end
+					IconHold.Visible = true
+					if IconObj and IconObj.Instance then
+						Custom:SetImage(IconObj.Instance, src)
+					else
+						IconObj = Custom:MakeIcon(IconHold, src, {
+							Size = UDim2.new(0, 16, 0, 16), Color = Text.TextColor3, Name = "LabelIcon",
+							AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+						})
+					end
+				end
+
+				return {
+					Label = LF,
+					Set = ApplyText,
+					SetText = ApplyText,
+					SetDescription = ApplyDesc,
+					SetDesc = ApplyDesc,
+					SetColor = ApplyColor,
+					SetIcon = ApplyIcon,
+					Get = function() return Text.Text end,
+					GetText = function() return Text.Text end,
+					GetDescription = function() return Desc and Desc.Visible and Desc.Text or "" end,
+				}
+			end
+
+			function SecFuncs:AddProgress(PConfig)
+				local PName = PConfig[1] or PConfig.Name or "Progress"
+				local PDefault = PConfig[2] or PConfig.Default or 0
+				local PMax = PConfig[3] or PConfig.Max or 100
+				if PMax <= 0 then PMax = 100 end
+				local PF, PStroke = Custom:Card(SectionContent, 44, PName .. "Progress", false)
+				Place(PF)
+				AddLeadingIcon(PF, PConfig.Icon or "activity", 26, "ProgressIcon")
+				Custom:Label(PF, {
+					Text = PName, TextTruncate = Enum.TextTruncate.AtEnd,
+					Position = UDim2.new(0, 43, 0, 4), Size = UDim2.new(1, -103, 0, 13), Name = "ProgressLabel",
+				})
+				local Percent = Custom:Label(PF, {
+					Text = "0%", TextColor3 = Theme.White, TextXAlignment = Enum.TextXAlignment.Right,
+					Position = UDim2.new(1, -60, 0, 4), Size = UDim2.new(0, 50, 0, 14), Name = "ProgressValue",
+				})
+				local Track2 = Custom:Create("Frame", {
+					BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
+					Position = UDim2.new(0, 43, 1, -12), Size = UDim2.new(1, -55, 0, 4), Name = "ProgressTrack",
+				}, PF)
+				Custom:Round(Track2)
+				local Fill = Custom:Create("Frame", {
+					BackgroundColor3 = Theme.White, BorderSizePixel = 0, Size = UDim2.new(0, 0, 1, 0), Name = "ProgressFill",
+				}, Track2)
+				Custom:Round(Fill)
+				Custom:AddGradient(Fill, 0)
+				local Value = 0
+				local function SetValue(v)
+					Value = math.clamp(tonumber(v) or 0, 0, PMax)
+					local Ratio = Value / PMax
+					Percent.Text = tostring(math.floor(Ratio * 100 + 0.5)) .. "%"
+					Custom:Tween(Fill, 0.25, { Size = UDim2.new(Ratio, 0, 1, 0) })
+				end
+				SetValue(PDefault)
+				Custom:Hover(PF, PStroke)
+				RegisterSearch(PName, PF, Where, SelectTab, EnsureOpen, TabFrame)
+				return { Progress = PF, Set = SetValue, Get = function() return Value end }
+			end
+
+			function SecFuncs:AddConfigManager(CMConfig)
+				if type(CMConfig) == "string" then CMConfig = { CMConfig } end
+				CMConfig = CMConfig or {}
+				local CMName = CMConfig[1] or CMConfig.Name or "Configs"
+				local Library = Rexxzy_Library
+				local Holder = Custom:Create("Frame", {
+					BackgroundTransparency = 1, BorderSizePixel = 0, AutomaticSize = Enum.AutomaticSize.Y,
+					Size = UDim2.new(1, 0, 0, 0), Name = CMName .. "ConfigManager",
+				}, SectionContent)
+				Custom:Create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, Holder)
+				Place(Holder)
+				local Idx = 0
+				local function Adopt(Frame)
+					Idx = Idx + 1
+					Frame.Parent = Holder
+					Frame.LayoutOrder = Idx
+				end
+				local function Say(Kind, Text)
+					Library:SetNotification({ Type = Kind, Content = Text })
+				end
+
+				local NameR = SecFuncs:AddInput({
+					Name = CMConfig.InputName or "Config name", Placeholder = "Type a name to save...", Default = "",
+				})
+				Adopt(NameR.Input.Parent)
+
+				local Ready = false
+				local DdR
+				DdR = SecFuncs:AddDropdown({
+					Name = CMConfig.DropdownName or "Saved configs", Options = Library:GetConfigs(), Deletable = true,
+					Empty = "No saved configs yet", Filter = false,
+					OnDelete = function(Name)
+						local Ok = Library:DeleteConfig(Name)
+						if Ok then Say("success", "Deleted " .. tostring(Name)) else Say("error", "Could not delete " .. tostring(Name)) end
+						return Ok
+					end,
+					Callback = function(Chosen)
+						local N = Chosen[1]
+						if N and Ready then NameR.Set(N) end
+					end,
+				})
+				Adopt(DdR.Dropdown)
+
+				local function Target()
+					local Typed = NameR.Get()
+					if Typed and string.gsub(Typed, "%s", "") ~= "" then return Typed end
+					return DdR.Get()[1]
+				end
+				local Busy = false
+
+				local SaveR = SecFuncs:AddButton({
+					Name = "Save config", Description = "Stored for this device and this account", Icon = "save",
+					Callback = function()
+						local N = Target()
+						if not N then Say("warning", "Type a config name first") return end
+						local Ok, Res = Library:SaveConfig(N)
+						if Ok then
+							Say("success", "Saved " .. tostring(Res))
+							DdR.Set(Res)
+						else
+							Say("error", tostring(Res))
+						end
+					end,
+				})
+				Adopt(SaveR.Button)
+
+				local LoadR = SecFuncs:AddButton({
+					Name = "Load config", Description = "Applies the selected config", Icon = "download",
+					Callback = function()
+						if Busy then return end
+						local N = DdR.Get()[1] or Target()
+						if not N then Say("warning", "Select a config first") return end
+						Busy = true
+						local Ok, Err = Library:LoadConfig(N, function(Done, Res)
+							Busy = false
+							if Done then Say("success", "Loaded " .. tostring(Res)) else Say("error", tostring(Res)) end
+						end)
+						if not Ok then
+							Busy = false
+							Say("error", tostring(Err))
+						end
+					end,
+				})
+				Adopt(LoadR.Button)
+
+				local RefreshR = SecFuncs:AddButton({
+					Name = "Refresh list", Description = "Rescan saved configs", Icon = "refresh-cw",
+					Callback = function()
+						Library:RescanConfigs(function()
+							DdR.Refresh(Library:GetConfigs(), true)
+							Say("info", "Found " .. tostring(#Library:GetConfigs()) .. " config(s)")
+						end, true)
+					end,
+				})
+				Adopt(RefreshR.Button)
+
+				local AutoLoadR
+				AutoLoadR = SecFuncs:AddToggle({
+					Name = "Auto load on start", Default = Library:GetAutoLoad() ~= nil, Content = "Loads this config when the script runs",
+					Callback = function(State)
+						if not Ready then return end
+						if State then
+							local N = DdR.Get()[1] or Target()
+							if not N then
+								Say("warning", "Select a config first")
+								AutoLoadR.Set(false)
+								return
+							end
+							Library:SetAutoLoad(N)
+						else
+							Library:SetAutoLoad(nil)
+						end
+					end,
+				})
+				Adopt(AutoLoadR.Toggle)
+
+				local AutoSaveR
+				AutoSaveR = SecFuncs:AddToggle({
+					Name = "Auto save changes", Default = Library:GetAutoSave() ~= nil, Content = "Saves the selected config when you change settings",
+					Callback = function(State)
+						if not Ready then return end
+						if State then
+							local N = Target()
+							if not N then
+								Say("warning", "Type or select a config first")
+								AutoSaveR.Set(false)
+								return
+							end
+							local Ok, Res = Library:SaveConfig(N)
+							if Ok then
+								Library:SetAutoSave(Res)
+								DdR.Set(Res)
+							else
+								Say("error", tostring(Res))
+								AutoSaveR.Set(false)
+							end
+						else
+							Library:SetAutoSave(nil)
+						end
+					end,
+				})
+				Adopt(AutoSaveR.Toggle)
+
+				local Info = SecFuncs:AddLabel({ "Configs follow your device or your account. Either one unlocks them." })
+				Adopt(Info.Label)
+
+				local Listener = Library:OnConfigsChanged(function()
+					if Holder.Parent then DdR.Refresh(Library:GetConfigs(), true) end
+				end)
+				Holder.Destroying:Connect(function() Listener.Disconnect() end)
+
+				Ready = true
+				Library:RescanConfigs(function()
+					if not Holder.Parent then return end
+					DdR.Refresh(Library:GetConfigs(), true)
+					local Auto = Library:GetAutoLoad()
+					if Auto then
+						for _, N in ipairs(Library:GetConfigs()) do
+							if N == Auto then DdR.Set(N) break end
+						end
+					end
+				end)
+				if CMConfig.AutoLoad ~= false and not Library.AutoLoadStarted then
+					Library.AutoLoadStarted = true
+					Library.AutoLoading = true
+					task.spawn(function()
+						task.wait(tonumber(CMConfig.AutoLoadDelay) or 1.2)
+						Library:LoadAutoConfig(function(Ok, Res)
+							Library.AutoLoading = false
+							Library.Armed = true
+							if Ok then Say("success", "Auto loaded " .. tostring(Res)) end
+						end)
+					end)
+				end
+				return {
+					ConfigManager = Holder,
+					Save = function(N) return Library:SaveConfig(N or Target()) end,
+					Load = function(N, Cb) return Library:LoadConfig(N or DdR.Get()[1], Cb) end,
+					Refresh = function() DdR.Refresh(Library:GetConfigs(), true) end,
+				}
+			end
+
+			local FrameKeys = {
+				AddButton = "Button", AddToggle = "Toggle", AddSlider = "Slider", AddInput = "Input", AddDropdown = "Dropdown",
+				AddKeybind = "Keybind", AddParagraph = "Paragraph", AddReadMe = "ReadMe", AddSeparator = "Separator",
+				AddLine = "Line", AddSocial = "Social", AddCopyGroup = "CopyGroup", AddColorPicker = "ColorPicker",
+				AddLabel = "Label", AddProgress = "Progress", AddConfigManager = "ConfigManager",
+			}
+			local FlagKinds = {
+				AddToggle = "toggle", AddSlider = "slider", AddInput = "input", AddDropdown = "dropdown",
+				AddKeybind = "keybind", AddColorPicker = "color",
+			}
+			local function Identity(v) return v end
+			local Codecs = {
+				toggle = { Identity, function(v) return v == true end },
+				slider = { Identity, function(v) return tonumber(v) end },
+				input = { Identity, function(v) return tostring(v) end },
+				dropdown = { Identity, function(v) return v end },
+				keybind = {
+					function(v) return v.Name end,
+					function(v) return v end,
+				},
+				color = {
+					function(c) return string.format("#%02X%02X%02X", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5)) end,
+					function(v) return v end,
+				},
+			}
+			local CallbackIndex = { AddToggle = 3, AddSlider = 5, AddInput = 4, AddDropdown = 4, AddKeybind = 3, AddColorPicker = 3 }
+			for Method, Key in pairs(FrameKeys) do
+				local Original = SecFuncs[Method]
+				SecFuncs[Method] = function(self, Cfg)
+					local CbIdx = CallbackIndex[Method]
+					if CbIdx and type(Cfg) == "table" and Cfg.Flag then
+						local Copy = {}
+						for K, V in pairs(Cfg) do Copy[K] = V end
+						local Orig = Cfg[CbIdx] or Cfg.Callback or function() end
+						local Wrapped = function(...)
+							Rexxzy_Library:MarkDirty()
+							return Orig(...)
+						end
+						Copy[CbIdx] = Wrapped
+						Copy.Callback = Wrapped
+						Cfg = Copy
+					end
+					local Result = Original(self, Cfg)
+					local Frame = Result[Key]
+					Result.Frame = Frame
+					Result.SetVisible = function(State) if Frame and Frame.Parent then Frame.Visible = State and true or false end end
+					local FlagName = type(Cfg) == "table" and Cfg.Flag or nil
+					Result.Destroy = function()
+						if FlagName and Rexxzy_Library.Elements[FlagName] and Rexxzy_Library.Elements[FlagName].Owner == Result then
+							Rexxzy_Library.Elements[FlagName] = nil
+						end
+						if Frame and Frame.Parent then Frame:Destroy() end
+					end
+					local Kind = FlagKinds[Method]
+					if Kind and FlagName then
+						local Codec = Codecs[Kind]
+						local Decode = Codec[2]
+						if Kind == "color" then
+							Decode = function(v)
+								local Hex = string.match(tostring(v), "^#?(%x%x%x%x%x%x)$")
+								if not Hex then return nil end
+								return Color3.fromRGB(tonumber(string.sub(Hex, 1, 2), 16), tonumber(string.sub(Hex, 3, 4), 16), tonumber(string.sub(Hex, 5, 6), 16))
+							end
+						elseif Kind == "keybind" then
+							Decode = function(v)
+								local ok, Key = pcall(function() return Enum.KeyCode[tostring(v)] end)
+								return ok and Key or nil
+							end
+						end
+						Rexxzy_Library.Elements[tostring(FlagName)] = {
+							Owner = Result, Get = Result.Get, Set = Result.Set, Encode = Codec[1], Decode = Decode,
+						}
+					end
+					return Result
+				end
+			end
+
+			function SecFuncs:SetOpen(State) SetSectionOpen(State == true, true) end
+			function SecFuncs:SetTitle(NewTitle) HeaderLabel.Text = tostring(NewTitle) end
+
+			return SecFuncs
+		end
+
+		return TabFuncs
+	end
+
+	
+	-- No splash/intro screen: show the finished library immediately.
+	DropShadowHolder.Visible = true
+	WindowScale.Scale = Base
+
+	-- Preserve the original short safety window before config autosave is armed.
+	task.delay(3, function()
+		if not Rexxzy_Library.AutoLoading then Rexxzy_Library.Armed = true end
+	end)
+
+	return Funcs
+end
+
+--[[
+KEY SYSTEM TEMPLATE MODULE
+- UI and interaction logic are implemented below.
+- No real API, key provider, Discord invite, or key is pre-configured.
+- Fill your own values in KeySystem_Config_Template.lua.
+]]
+local KeySys = {}
+
+function KeySys.IsDict(T)
+	return type(T) == "table" and T[1] == nil and next(T) ~= nil
+end
+
+function KeySys.Merge(Base, User)
+	local Out = {}
+	for K, V in pairs(Base) do Out[K] = V end
+	if type(User) ~= "table" then return Out end
+	for K, V in pairs(User) do
+		if KeySys.IsDict(V) and KeySys.IsDict(Base[K]) then
+			Out[K] = KeySys.Merge(Base[K], V)
+		else
+			Out[K] = V
+		end
+	end
+	return Out
+end
+
+-- GENERIC PROVIDER PRESETS
+-- Replace the names, links, callbacks, and appearance in your own config.
+KeySys.ProviderPresets = {
+	free = {
+		Name = "YOUR_FREE_PROVIDER_NAME", Type = "Free", Logo = "key",
+		ButtonText = "YOUR_FREE_BUTTON_TEXT",
+	},
+	premium = {
+		Name = "YOUR_PREMIUM_PROVIDER_NAME", Type = "Premium", Logo = "badge-check",
+		ButtonText = "YOUR_PREMIUM_BUTTON_TEXT",
+	},
+	custom = {
+		Name = "YOUR_CUSTOM_PROVIDER_NAME", Type = "Free", Logo = "key",
+		ButtonText = "YOUR_CUSTOM_BUTTON_TEXT",
+	},
+}
+
+function KeySys.ResolveProvider(P, Index)
+	if type(P) ~= "table" or P.Enabled == false then return nil end
+	local PresetKey = type(P.Preset) == "string" and string.lower(P.Preset) or ""
+	local Preset = KeySys.ProviderPresets[PresetKey] or {}
+	local TypeRaw = string.lower(tostring(P.Type or Preset.Type or "Free"))
+	local Type = (TypeRaw == "premium" or TypeRaw == "paid" or TypeRaw == "vip") and "Premium" or "Free"
+	local Id = tostring(P.Id or (PresetKey ~= "" and PresetKey) or ("provider" .. Index))
+	return {
+		Id = Id,
+		Name = tostring(P.Name or Preset.Name or Id),
+		Type = Type,
+		Logo = P.Logo or P.Icon or Preset.Logo or "link",
+		Url = type(P.Url) == "string" and P.Url or nil,
+		Accent = typeof(P.Accent) == "Color3" and P.Accent or (typeof(Preset.Accent) == "Color3" and Preset.Accent or nil),
+		ButtonText = P.ButtonText or Preset.ButtonText,
+		GetKey = type(P.GetKey) == "function" and P.GetKey or nil,
+		Verify = type(P.Verify) == "function" and P.Verify or nil,
+		VerifyUrl = type(P.VerifyUrl) == "table" and P.VerifyUrl or nil,
+		Settings = type(P.Settings) == "table" and P.Settings or nil,
+		Timeout = tonumber(P.Timeout),
+		Order = tonumber(P.Order) or Index,
+	}
+end
+
+function KeySys.Defaults()
+	return {
+		Title = "YOUR_HUB_NAME",
+		Description = "YOUR_KEY_SYSTEM_DESCRIPTION",
+		Icon = "YOUR_ICON_NAME",
+		
+		Style = "Full",
+		AccountIndependent = true,
+		AllowMultipleAccounts = true,
+		HWIDMode = "Disabled",
+		Window = {
+			Width = 400, Scale = 1.05, Padding = 16, CornerRadius = 14, Border = true, BorderTransparency = 0.25,
+			BackgroundTransparency = 0.02, Backdrop = true, BackdropTransparency = 0.5, CloseButton = true,
+			CloseBehavior = "Destroy", DisplayOrder = 150,
+		},
+		Appearance = {
+			Panel = Theme.White, Accent = Theme.White, Text = Theme.Text, SubText = Theme.Sub, Border = Theme.White,
+			Button = Theme.Accent, ButtonText = Color3.fromRGB(14, 16, 28), Secondary = Theme.Panel,
+			Input = Theme.Field, InputText = Theme.Text, Success = Theme.White, Error = Theme.Red,
+			Warning = Color3.fromRGB(255, 255, 255), Info = Theme.AccentSoft,
+			Font = Enum.Font.Gotham, FontBold = Enum.Font.GothamBold, IconSize = 16, IconAlign = "Left",
+			Animations = true, AnimationTime = 0.2, ReducedMotion = false,
+		},
+		Authentication = {
+			DefaultMode = "API",
+			AccessMode = {
+				Enabled = false, Default = "Free",
+				FreeLabel = "Free", PremiumLabel = "Premium",
+				FreeDescription = "YOUR_FREE_ACCESS_DESCRIPTION",
+				PremiumDescription = "YOUR_PREMIUM_ACCESS_DESCRIPTION",
+				FreePlaceholder = "YOUR_FREE_KEY_PLACEHOLDER", PremiumPlaceholder = "YOUR_PREMIUM_KEY_PLACEHOLDER",
+				FreeVerifyText = "YOUR_FREE_VERIFY_BUTTON_TEXT", PremiumVerifyText = "YOUR_PREMIUM_VERIFY_BUTTON_TEXT",
+				FreeAccent = Color3.fromRGB(245, 245, 245), PremiumAccent = Color3.fromRGB(255, 184, 0),
+			},
+			Keyless = {
+				Enabled = false, ButtonText = "Keyless Mode", LoadingText = "Loading Keyless...",
+				SuccessText = "Keyless access granted.", HideFreeKeyEntry = true, Timeout = 20,
+			},
+			Placeholder = "Enter your key...",
+			PasswordPlaceholder = "Enter the password...",
+			VerifyText = "Verify",
+			GetKeyText = "Get Key",
+			LoadingText = "Verifying...",
+			GetKeyLoadingText = "Preparing link...",
+			SuccessText = "Key verified.",
+			Timeout = 10,
+			Retry = { Attempts = 1, Delay = 1.5 },
+			Cooldown = 1,
+			Trim = true,
+			MaxLength = 512,
+			ShowProviderName = true,
+			
+			GroupByType = true,
+			FreeLabel = "Free Key",
+			PremiumLabel = "Premium Key",
+			Messages = {
+				Empty = "Enter your key to continue.",
+				Invalid = "That key is not valid.",
+				WrongTier = "This key does not match the selected access mode.",
+				ApiError = "Could not reach the verification service.",
+				Timeout = "The request timed out. Try again.",
+				NotConfigured = "Verification is not configured.",
+				NoMethod = "No authentication method is enabled.",
+				ProviderMissing = "This provider has no link configured.",
+				Copied = "Link copied. Finish the steps, then paste your key here.",
+				ClipboardFailed = "Clipboard is not available. Copy the link manually.",
+				DeviceUnavailable = "A device identifier is required but unavailable.",
+				KeyReceived = "Key received. Press Verify to check it.",
+				Busy = "Please wait for the current request.",
+				Cooldown = "Please wait a moment before trying again.",
+			},
+			API = { Enabled = false, Providers = {} },
+			Password = { Enabled = false, Password = "", CaseSensitive = true },
+		},
+		Discord = {
+			Enabled = false, Text = "YOUR_SUPPORT_LABEL", LinkText = "YOUR_DISCORD_BUTTON_TEXT", Color = Color3.fromRGB(88, 101, 242),
+			Icon = "message-circle", IconSize = 14, InviteURL = "YOUR_DISCORD_INVITE_URL",
+			CopiedMessage = "Discord invite copied to clipboard.",
+			MissingMessage = "The Discord invite has not been configured.",
+		},
+		Device = {
+			UseExecutorFunction = false, SendToVerifyUrl = false,
+			Notice = "A device identifier is used for verification.",
+		},
+		Account = {
+			SendToVerifyUrl = false,
+			Notice = "Your Roblox account is used for verification.",
+		},
+		Behavior = {
+			CloseOnSuccess = true, SuccessDelay = 0.9, ClipboardFallback = "Show", Notifications = true,
+			NotificationDelay = 3, ReplaceExisting = true,
+			Persist = { Enabled = false, Folder = "YOUR_LIBRARY_NAME", Name = "YOUR_CONFIG_NAME", Days = 0, AutoVerify = true },
+		},
+		Callbacks = {},
+	}
+end
+
+function KeySys.Trim(Text)
+	local T = string.gsub(tostring(Text or ""), "^%s+", "")
+	T = string.gsub(T, "%s+$", "")
+	return T
+end
+
+function KeySys.Copy(Text)
+	local Fn = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+	if not Fn then return false end
+	local Ok = pcall(Fn, tostring(Text))
+	return Ok
+end
+
+function KeySys.Request(Opts)
+	local Req = (syn and syn.request) or (http and http.request) or request or http_request
+	if Req then
+		local Ok, R = pcall(Req, Opts)
+		if not Ok or type(R) ~= "table" then return nil, "request failed" end
+		return { Status = tonumber(R.StatusCode or R.status_code) or 0, Body = type(R.Body) == "string" and R.Body or "" }
+	end
+	if string.upper(tostring(Opts.Method or "GET")) == "GET" then
+		local Ok, Body = pcall(function() return game:HttpGet(Opts.Url) end)
+		if Ok and type(Body) == "string" then return { Status = 200, Body = Body } end
+		return nil, "request failed"
+	end
+	return nil, "http unavailable"
+end
+
+function KeySys.Escape(Text, Mode)
+	Text = tostring(Text or "")
+	if Mode == "url" then return HttpService:UrlEncode(Text) end
+	if Mode == "json" then
+		local Enc = HttpService:JSONEncode({ Text })
+		return string.sub(Enc, 3, #Enc - 2)
+	end
+	return (string.gsub(Text, "%c", ""))
+end
+
+function KeySys.Fill(Template, Mode, Values)
+	return (string.gsub(tostring(Template), "{(%a+)}", function(Name)
+		local V = Values[string.lower(Name)]
+		if V == nil then return nil end
+		return KeySys.Escape(V, Mode)
+	end))
+end
+
+function KeySys.Values(Key, Context)
+	local Send = Context.Send or {}
+	local GameName = "Unknown"
+	local Executor = "Unknown"
+	pcall(function()
+		local Info = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+		if Info and Info.Name then GameName = tostring(Info.Name) end
+	end)
+	pcall(function()
+		if identifyexecutor then Executor = tostring(identifyexecutor())
+		elseif getexecutorname then Executor = tostring(getexecutorname()) end
+	end)
+	local Stamp = tostring(os.time())
+	local Nonce = Stamp .. "-" .. tostring(math.random(100000, 999999))
+	return {
+		key = Key,
+		hwid = (Send.HWID and Context.HWID) or "",
+		userid = (Send.Account and Context.UserId ~= nil) and tostring(Context.UserId) or "",
+		username = (Send.Account and Context.Username) or "",
+		multi = tostring(Context.Policy and Context.Policy.AllowMultipleAccounts == true),
+		tier = tostring(Context.AccessTier or ""),
+		placeid = tostring(game.PlaceId),
+		gamename = GameName,
+		executor = Executor,
+		nonce = Nonce,
+		timestamp = Stamp,
+	}
+end
+
+function KeySys.JsonPath(Data, Path)
+	local Cur = Data
+	for Part in string.gmatch(tostring(Path), "[^%.]+") do
+		if type(Cur) ~= "table" then return nil end
+		local Nxt = Cur[Part]
+		if Nxt == nil then
+			local Num = tonumber(Part)
+			if Num ~= nil then Nxt = Cur[Num] end
+		end
+		Cur = Nxt
+	end
+	return Cur
+end
+
+function KeySys.MakeUrlVerifier(Spec)
+	return function(Key, Context)
+		if type(Spec.Url) ~= "string" or Spec.Url == "" then return nil, "no url" end
+		local Values = KeySys.Values(Key, Context)
+		local Headers = {}
+		if type(Spec.Headers) == "table" then
+			for K, V in pairs(Spec.Headers) do Headers[tostring(K)] = KeySys.Fill(V, "header", Values) end
+		end
+		local Body = nil
+		if Spec.Body ~= nil then Body = KeySys.Fill(Spec.Body, "json", Values) end
+		local R, Err = KeySys.Request({
+			Url = KeySys.Fill(Spec.Url, "url", Values), Method = string.upper(tostring(Spec.Method or "GET")),
+			Headers = Headers, Body = Body,
+		})
+		if not R then return nil, Err end
+		if R.Status == 0 or R.Status == 429 or R.Status >= 500 then return nil, "status " .. tostring(R.Status) end
+		if R.Status < 200 or R.Status > 299 then return false, "rejected" end
+		if type(Spec.SuccessBody) == "string" then
+			if string.lower(tostring(Spec.MatchMode or "contains")) == "equals" then
+				if KeySys.Trim(R.Body) ~= Spec.SuccessBody then return false, "rejected" end
+			elseif not string.find(R.Body, Spec.SuccessBody, 1, true) then
+				return false, "rejected"
+			end
+		end
+		local ResponseData = nil
+		if type(Spec.SuccessJson) == "table" then
+			local Ok, Data = pcall(function() return HttpService:JSONDecode(R.Body) end)
+			if not Ok or type(Data) ~= "table" then return nil, "bad json" end
+			local Want = Spec.SuccessJson.Value
+			if Want == nil then Want = true end
+			if KeySys.JsonPath(Data, Spec.SuccessJson.Field) ~= Want then return false, "rejected" end
+			ResponseData = Data
+		end
+		return true, ResponseData
+	end
+end
+
+function KeySys.RunWithTimeout(Seconds, Work, Done)
+	local Finished = false
+	local function Finish(...)
+		if Finished then return end
+		Finished = true
+		Done(...)
+	end
+	task.delay(Seconds, function() Finish("timeout") end)
+	task.spawn(function()
+		local Packed = table.pack(pcall(Work))
+		if Packed[1] then
+			Finish("done", table.unpack(Packed, 2, Packed.n))
+		else
+			Finish("error", tostring(Packed[2]))
+		end
+	end)
+end
+
+function KeySys.HwidMode(Cfg)
+	local M = string.lower(tostring(Cfg.HWIDMode or "disabled"))
+	if M == "optional" then return "Optional" end
+	if M == "strict" then return "Strict" end
+	return "Disabled"
+end
+
+function KeySys.Hwid(Cfg)
+	local Dev = Cfg.Device
+	if type(Dev.Provider) == "function" then
+		local Ok, V = pcall(Dev.Provider)
+		if Ok and type(V) == "string" and V ~= "" then return V end
+		return nil
+	end
+	if Dev.UseExecutorFunction == true then
+		local Fn = gethwid or get_hwid
+		if Fn then
+			local Ok, V = pcall(Fn)
+			if Ok and type(V) == "string" and V ~= "" then return V end
+		end
+	end
+	return nil
+end
+
+function KeySys.BuildContext(Cfg, Key, Mode, AccessTier)
+	local HM = KeySys.HwidMode(Cfg)
+	local Context = {
+		Key = Key, Mode = Mode, AccessTier = AccessTier,
+		Policy = {
+			AccountIndependent = Cfg.AccountIndependent ~= false,
+			AllowMultipleAccounts = Cfg.AllowMultipleAccounts ~= false,
+			HWIDMode = HM,
+		},
+		Send = { HWID = false, Account = false },
+	}
+	if HM ~= "Disabled" then
+		Context.HWID = KeySys.Hwid(Cfg)
+		Context.Send.HWID = Cfg.Device.SendToVerifyUrl == true
+	end
+	if Context.Policy.AccountIndependent == false and Player then
+		Context.UserId = Player.UserId
+		Context.Username = Player.Name
+		Context.Send.Account = Cfg.Account.SendToVerifyUrl == true
+	end
+	return Context
+end
+
+function KeySys.WithProvider(Context, Provider)
+	local Copy = {}
+	for K, V in pairs(Context) do Copy[K] = V end
+	if Provider then Copy.Provider = { Id = Provider.Id, Name = Provider.Name, Settings = Provider.Settings } end
+	return Copy
+end
+
+function Rexxzy_Library:CreateKeySystem(UserConfig)
+	local Cfg = KeySys.Merge(KeySys.Defaults(), UserConfig)
+	if type(Cfg.Key) == "boolean" then
+		Cfg.Authentication.API.Enabled = Cfg.Key
+		Cfg.Authentication.Password.Enabled = not Cfg.Key
+		Cfg.Authentication.DefaultMode = Cfg.Key and "API" or "Password"
+	end
+	if type(Cfg.Password) == "string" or type(Cfg.Password) == "table" then
+		Cfg.Authentication.Password.Password = Cfg.Password
+	end
+	local Win, App, Auth, Msg = Cfg.Window, Cfg.Appearance, Cfg.Authentication, Cfg.Authentication.Messages
+	local API, PwCfg, Behavior, DiscordCfg = Auth.API, Auth.Password, Cfg.Behavior, Cfg.Discord
+	local Callbacks = type(Cfg.Callbacks) == "table" and Cfg.Callbacks or {}
+	local PersistCfg = type(Behavior.Persist) == "table" and Behavior.Persist or {}
+	local Self = {}
+	local Conns, Tweens, Spinners = {}, {}, {}
+	local Destroyed, Closing, Busy, Verified, SuccessFired, PersistTrial = false, false, false, false, false, false
+	local LastFail = -100
+	local Mode = "API"
+	local AccessCfg = type(Auth.AccessMode) == "table" and Auth.AccessMode or {}
+	local KeylessCfg = type(Auth.Keyless) == "table" and Auth.Keyless or {}
+	local AccessEnabled = AccessCfg.Enabled == true
+	local AccessTier = string.lower(tostring(AccessCfg.Default or "Free")) == "premium" and "Premium" or "Free"
+	local Intro = true
+	local TargetScale = 1
+
+	if Behavior.ReplaceExisting ~= false and Rexxzy_Library.ActiveKeySystem then
+		local Old = Rexxzy_Library.ActiveKeySystem
+		Rexxzy_Library.ActiveKeySystem = nil
+		pcall(function() Old:Destroy(true) end)
+	end
+	Rexxzy_Library.ActiveKeySystem = Self
+
+	local function Dead() return Destroyed or Closing end
+	local function Track(C) table.insert(Conns, C) return C end
+	local function Col(V, D) return typeof(V) == "Color3" and V or D end
+
+	local CAccent = Col(App.Accent, Theme.White)
+	local CPanel = Col(App.Panel, Theme.White)
+	local CText = Col(App.Text, Theme.Text)
+	local CSub = Col(App.SubText, Theme.Sub)
+	local CBorder = Col(App.Border, Theme.White)
+	local CButton = Col(App.Button, Theme.White)
+	local CButtonText = Col(App.ButtonText, Theme.Black)
+	local CSecondary = Col(App.Secondary, Theme.White)
+	local CInput = Col(App.Input, Theme.Field)
+	local CInputText = Col(App.InputText, Theme.Text)
+	local FontBody = typeof(App.Font) == "EnumItem" and App.Font or Enum.Font.Gotham
+	local FontBold = typeof(App.FontBold) == "EnumItem" and App.FontBold or Enum.Font.GothamBold
+	local IconSize = math.clamp(tonumber(App.IconSize) or 16, 10, 32)
+	local IconRight = string.lower(tostring(App.IconAlign or "left")) == "right"
+	local AnimOn = false -- All key-system motion effects are disabled by default.
+	local Mult = math.clamp((tonumber(App.AnimationTime) or 0.2) / 0.2, 0.25, 5)
+	local Pad = math.clamp(tonumber(Win.Padding) or 14, 6, 32)
+
+	local function Anim(Inst, Time, Props, Style, Dir)
+		if not Inst or not Inst.Parent then return nil end
+		if AnimOn then return Custom:Tween(Inst, (Time or 0.2) * Mult, Props, Style, Dir) end
+		for K, V in pairs(Props) do Inst[K] = V end
+		return nil
+	end
+
+	local function Fire(Name, ...)
+		local Fn = Callbacks[Name]
+		if type(Fn) ~= "function" then return end
+		local Args = table.pack(...)
+		task.spawn(function()
+			local Ok, Err = pcall(Fn, table.unpack(Args, 1, Args.n))
+			if not Ok then warn("[KeySystemTemplate] callback " .. Name .. " failed: " .. tostring(Err)) end
+		end)
+	end
+
+	local function Notify(Kind, Text)
+		if Behavior.Notifications == false or not Text or Text == "" then return end
+		Rexxzy_Library:SetNotification({ Type = Kind, Content = tostring(Text), Delay = tonumber(Behavior.NotificationDelay) or 3 })
+	end
+
+	local ApiOn = type(API) == "table" and API.Enabled == true
+	local PwOn = type(PwCfg) == "table" and PwCfg.Enabled == true
+	do
+		local Want = string.lower(tostring(Auth.DefaultMode or "api")) == "password" and "Password" or "API"
+		if Want == "Password" and PwOn then Mode = "Password"
+		elseif Want == "API" and ApiOn then Mode = "API"
+		elseif ApiOn then Mode = "API"
+		elseif PwOn then Mode = "Password" end
+	end
+
+	local IsMini = string.lower(tostring(Cfg.Style or "Full")) == "mini"
+	if IsMini then
+		if Win.Width == nil or Win.Width == 400 then Win.Width = 300 end
+		if Win.Padding == nil or Win.Padding == 16 then Win.Padding = 12 end
+		if Win.CornerRadius == nil or Win.CornerRadius == 14 then Win.CornerRadius = 12 end
+		if Win.Scale == nil or Win.Scale == 1.05 then Win.Scale = 1 end
+	end
+	local GroupByType = Auth.GroupByType ~= false
+	local FreeLabel = tostring(Auth.FreeLabel or "Free Key")
+	local PremiumLabel = tostring(Auth.PremiumLabel or "Premium Key")
+
+	local Providers = {}
+	do
+		local List = type(API) == "table" and type(API.Providers) == "table" and API.Providers or {}
+		for Index, P in ipairs(List) do
+			local Resolved = KeySys.ResolveProvider(P, Index)
+			if Resolved then table.insert(Providers, Resolved) end
+		end
+		table.sort(Providers, function(A, B)
+			if GroupByType and A.Type ~= B.Type then
+				return A.Type == "Premium"
+			end
+			return (A.Order or 0) < (B.Order or 0)
+		end)
+	end
+
+	local Gui = Custom:Create("ScreenGui", {
+		Name = "KeySystemTemplate", ZIndexBehavior = Enum.ZIndexBehavior.Sibling, ResetOnSpawn = false,
+		IgnoreGuiInset = true, DisplayOrder = tonumber(Win.DisplayOrder) or 150,
+	}, Custom:GetGuiParent())
+	local BackdropGoal = Win.Backdrop == false and 1 or (tonumber(Win.BackdropTransparency) or 0.5)
+	local Backdrop = Custom:Create("Frame", {
+		Active = Win.Backdrop ~= false, BackgroundColor3 = Theme.Black, BackgroundTransparency = 1, BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0), Name = "Backdrop",
+	}, Gui)
+
+	local BasePos = typeof(Win.Position) == "UDim2" and Win.Position or UDim2.new(0.5, 0, 0.5, 0)
+	local Width = math.clamp(tonumber(Win.Width) or (IsMini and 300 or 360), 220, 640)
+	local Radius = math.clamp(tonumber(Win.CornerRadius) or (IsMini and 12 or 14), 0, 28)
+	local Main = Custom:Create("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = typeof(App.Background) == "Color3" and App.Background or Theme.White,
+		BackgroundTransparency = tonumber(Win.BackgroundTransparency) or 0.02, BorderSizePixel = 0, ClipsDescendants = true,
+		Position = BasePos, Size = UDim2.new(0, Width, 0, 0), Name = "Main",
+	}, Gui)
+	Custom:Corner(Main, Radius)
+	if typeof(App.Background) ~= "Color3" then Custom:AddGradient(Main, 125, Custom.GradientWindow) end
+	local UIScaleObj = Custom:Create("UIScale", { Scale = 0.5 }, Main)
+	if Win.Border ~= false then
+		local Stroke = Custom:Stroke(Main, CBorder, tonumber(Win.BorderTransparency) or 0.25, 1.5)
+		local Grad = Custom:AddGradient(Stroke, 0, Custom.GradientBorder)
+		if AnimOn then
+			local Tw = TweenService:Create(Grad, TweenInfo.new(6, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false, 0), { Rotation = 360 })
+			table.insert(Tweens, Tw)
+			Tw:Play()
+		end
+	end
+	Custom:Create("UIPadding", {
+		PaddingTop = UDim.new(0, Pad), PaddingBottom = UDim.new(0, Pad), PaddingLeft = UDim.new(0, Pad), PaddingRight = UDim.new(0, Pad),
+	}, Main)
+	Custom:Create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 10) }, Main)
+
+	local function Ic(Parent, Source, Fallback, Props)
+		local Obj = Custom:MakeIcon(Parent, Source, Props)
+		if not Obj and Fallback then Obj = Custom:MakeIcon(Parent, Fallback, Props) end
+		return Obj
+	end
+
+	local function HoverFx(Btn, Stroke, BaseT, HoverT, StrokeBase, StrokeHover)
+		Track(Btn.MouseEnter:Connect(function()
+			if Busy then return end
+			Anim(Btn, 0.15, { BackgroundTransparency = HoverT })
+			if Stroke then Anim(Stroke, 0.15, { Transparency = StrokeHover }) end
+		end))
+		Track(Btn.MouseLeave:Connect(function()
+			if Busy then return end
+			Anim(Btn, 0.2, { BackgroundTransparency = BaseT })
+			if Stroke then Anim(Stroke, 0.2, { Transparency = StrokeBase }) end
+		end))
+	end
+
+	local Header = Custom:Create("Frame", {
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 1,
+		Size = UDim2.new(1, 0, 0, 0), Name = "Header",
+	}, Main)
+	Custom:Create("UISizeConstraint", { MinSize = Vector2.new(0, 36) }, Header)
+	local HeaderIcon = Custom:Create("Frame", {
+		BackgroundColor3 = CPanel, BackgroundTransparency = 0.92, BorderSizePixel = 0, Size = UDim2.new(0, 34, 0, 34), Name = "HeaderIcon",
+	}, Header)
+	Custom:Corner(HeaderIcon, 9)
+	Custom:Stroke(HeaderIcon, CBorder, 0.85, 1)
+	Ic(HeaderIcon, Cfg.Icon, "key", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 18, 0, 18), Color = CAccent, Name = "Icon",
+	})
+	local HeaderText = Custom:Create("Frame", {
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.new(0, 44, 0, 0),
+		Size = UDim2.new(1, -78, 0, 0), Name = "HeaderText",
+	}, Header)
+	Custom:Create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 2) }, HeaderText)
+	local TitleLabel = Custom:Label(HeaderText, {
+		Font = FontBold, Text = tostring(Cfg.Title), TextColor3 = CText, TextSize = 14, TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+		Size = UDim2.new(1, 0, 0, 17), LayoutOrder = 1, Name = "Title",
+	})
+	local DescLabel = Custom:Label(HeaderText, {
+		Font = FontBody, Text = tostring(Cfg.Description or ""), TextColor3 = CSub, TextSize = 11, TextWrapped = true,
+		AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 14), LayoutOrder = 2, Visible = tostring(Cfg.Description or "") ~= "",
+		Name = "Description",
+	})
+
+	local AccessToggle, FreeModeBtn, PremiumModeBtn, AccessSlider
+	local FreeAccent = Col(AccessCfg.FreeAccent, CAccent)
+	local PremiumAccent = Col(AccessCfg.PremiumAccent, Color3.fromRGB(255, 184, 0))
+	if AccessEnabled then
+		AccessToggle = Custom:Create("Frame", {
+			BackgroundColor3 = CInput, BorderSizePixel = 0, LayoutOrder = 2,
+			Size = UDim2.new(1, 0, 0, 36), Name = "AccessModeToggle",
+		}, Main)
+		Custom:Corner(AccessToggle, 9)
+		Custom:Stroke(AccessToggle, CBorder, 0.78, 1)
+		AccessSlider = Custom:Create("Frame", {
+			BackgroundColor3 = AccessTier == "Premium" and PremiumAccent or FreeAccent,
+			BorderSizePixel = 0,
+			Position = AccessTier == "Premium" and UDim2.new(0.5, 2, 0, 3) or UDim2.fromOffset(3, 3),
+			Size = UDim2.new(0.5, -5, 1, -6), Name = "AccessSlider",
+		}, AccessToggle)
+		Custom:Corner(AccessSlider, 7)
+		FreeModeBtn = Custom:Create("TextButton", {
+			Text = tostring(AccessCfg.FreeLabel or "Free"), Font = FontBold, TextSize = 12,
+			TextColor3 = AccessTier == "Free" and Theme.Black or CSub,
+			BackgroundTransparency = 1, BorderSizePixel = 0, AutoButtonColor = false,
+			Position = UDim2.fromOffset(0, 0), Size = UDim2.new(0.5, 0, 1, 0), ZIndex = 2, Name = "FreeMode",
+		}, AccessToggle)
+		PremiumModeBtn = Custom:Create("TextButton", {
+			Text = tostring(AccessCfg.PremiumLabel or "Premium"), Font = FontBold, TextSize = 12,
+			TextColor3 = AccessTier == "Premium" and Theme.Black or CSub,
+			BackgroundTransparency = 1, BorderSizePixel = 0, AutoButtonColor = false,
+			Position = UDim2.new(0.5, 0, 0, 0), Size = UDim2.new(0.5, 0, 1, 0), ZIndex = 3, Name = "PremiumMode",
+		}, AccessToggle)
+	end
+
+	local CloseBtn
+	if Win.CloseButton ~= false then
+		CloseBtn = Custom:Create("TextButton", {
+			Text = "", AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0), BackgroundColor3 = Theme.Red, BorderSizePixel = 0,
+			ClipsDescendants = true, Position = UDim2.new(1, 0, 0, 0), Size = UDim2.new(0, 26, 0, 26), Name = "Close",
+		}, Header)
+		Custom:Corner(CloseBtn, 7)
+		Ic(CloseBtn, "x", nil, {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 14, 0, 14), Color = Theme.White, Name = "CloseIcon",
+		})
+		Track(CloseBtn.MouseEnter:Connect(function() Anim(CloseBtn, 0.15, { BackgroundColor3 = Theme.RedHover }) end))
+		Track(CloseBtn.MouseLeave:Connect(function() Anim(CloseBtn, 0.2, { BackgroundColor3 = Theme.Red }) end))
+	end
+
+	local InputFrame = Custom:Create("Frame", {
+		BackgroundColor3 = CInput, BorderSizePixel = 0, LayoutOrder = 3, Size = UDim2.new(1, 0, 0, 38), Name = "InputFrame",
+	}, Main)
+	Custom:Corner(InputFrame, 8)
+	local InputStroke = Custom:Stroke(InputFrame, CBorder, 0.85, 1)
+	local InputIcons = {}
+	for Name, Src in pairs({ API = "key", Password = "lock" }) do
+		InputIcons[Name] = Ic(InputFrame, Src, "key", {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 11, 0.5, 0), Size = UDim2.new(0, 16, 0, 16), Color = CSub, Name = "InputIcon" .. Name,
+		})
+	end
+	local ShowPasteButton = AccessEnabled or Auth.ShowPasteButton == true
+	local InputBox = Custom:Create("TextBox", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, ClearTextOnFocus = false, Font = FontBody, Text = "", PlaceholderText = "",
+		PlaceholderColor3 = CSub, TextColor3 = CInputText, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+		Position = UDim2.new(0, 36, 0, 0), Size = ShowPasteButton and UDim2.new(1, -88, 1, 0) or UDim2.new(1, -46, 1, 0),
+		ClipsDescendants = true, Name = "InputBox",
+	}, InputFrame)
+	local PasteBtn
+	if ShowPasteButton then
+		PasteBtn = Custom:Create("TextButton", {
+			Text = "Paste", Font = FontBold, TextSize = 10, TextColor3 = CAccent,
+			BackgroundColor3 = CSecondary, BackgroundTransparency = 0.08, BorderSizePixel = 0,
+			AutoButtonColor = false, AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -6, 0.5, 0),
+			Size = UDim2.new(0, 46, 0, 26), Name = "PasteButton",
+		}, InputFrame)
+		Custom:Corner(PasteBtn, 6)
+		Custom:Stroke(PasteBtn, CBorder, 0.72, 1)
+	end
+
+	local StatusRow = Custom:Create("Frame", {
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 4,
+		Size = UDim2.new(1, 0, 0, 18), Name = "Status",
+	}, Main)
+	Custom:Create("UISizeConstraint", { MinSize = Vector2.new(0, 18) }, StatusRow)
+	local StatusSlot = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, 2), Size = UDim2.new(0, 14, 0, 14), Name = "StatusSlot",
+	}, StatusRow)
+	local StatusLabel = Custom:Label(StatusRow, {
+		Font = FontBody, Text = "", TextColor3 = CSub, TextSize = 11, TextWrapped = true, AutomaticSize = Enum.AutomaticSize.Y,
+		Position = UDim2.new(0, 20, 0, 1), Size = UDim2.new(1, -20, 0, 14), Name = "StatusText",
+	})
+	local StatusDefs = {
+		loading = { "loader", CSub }, success = { "check-circle", Col(App.Success, Theme.White) },
+		error = { "x-circle", Col(App.Error, Theme.Red) }, warning = { "alert-triangle", Col(App.Warning, Theme.AccentSoft) },
+		info = { "info", Col(App.Info, Theme.AccentSoft) },
+	}
+	local StatusIcons = {}
+	for Kind, Def in pairs(StatusDefs) do
+		local Obj = Ic(StatusSlot, Def[1], "info", { Size = UDim2.new(0, 14, 0, 14), Color = Def[2], Name = "Status" .. Kind })
+		if Obj then
+			Obj.Instance.Visible = false
+			Obj.Instance.AnchorPoint = Vector2.new(0.5, 0.5)
+			Obj.Instance.Position = UDim2.new(0.5, 0, 0.5, 0)
+			StatusIcons[Kind] = Obj
+		end
+	end
+
+	local LinkBox = Custom:Create("TextBox", {
+		BackgroundColor3 = CInput, BorderSizePixel = 0, ClearTextOnFocus = false, Font = FontBody, Text = "", PlaceholderText = "",
+		TextColor3 = CInputText, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left, ClipsDescendants = true, LayoutOrder = 5,
+		Size = UDim2.new(1, 0, 0, 28), Visible = false, Name = "LinkBox",
+	}, Main)
+	Custom:Corner(LinkBox, 7)
+	Custom:Stroke(LinkBox, CBorder, 0.85, 1)
+	Custom:Create("UIPadding", { PaddingLeft = UDim.new(0, 9), PaddingRight = UDim.new(0, 9) }, LinkBox)
+
+	local function ButtonContent(Btn, IconSrc, Fallback, Text, IconColor, TextColor)
+		local Inner = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), AutomaticSize = Enum.AutomaticSize.XY, BackgroundTransparency = 1, BorderSizePixel = 0,
+			Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 0, 0, 0), Name = "Content",
+		}, Btn)
+		Custom:Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 7),
+		}, Inner)
+		local Label = Custom:Label(Inner, {
+			Font = FontBold, Text = Text, TextColor3 = TextColor, TextSize = 12, AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.new(0, 0, 0, 16), LayoutOrder = IconRight and 1 or 2, Name = "Text",
+		})
+		local Icon = nil
+		if IconSrc then
+			Icon = Ic(Inner, IconSrc, Fallback, {
+				Size = UDim2.new(0, IconSize, 0, IconSize), Color = IconColor, LayoutOrder = IconRight and 2 or 1, Name = "Icon",
+			})
+		end
+		return Inner, Label, Icon
+	end
+
+	local VerifyBtn = Custom:Create("TextButton", {
+		Text = "", AutoButtonColor = false, BackgroundColor3 = CButton, BorderSizePixel = 0, ClipsDescendants = true, LayoutOrder = 6,
+		Size = UDim2.new(1, 0, 0, IsMini and 32 or 36), Name = "Verify",
+	}, Main)
+	Custom:Corner(VerifyBtn, IsMini and 7 or 8)
+	local VerifyStroke
+	if AccessEnabled then VerifyStroke = Custom:Stroke(VerifyBtn, FreeAccent, 0.48, 1) end
+	if CButton == Theme.White then Custom:AddGradient(VerifyBtn, 90) end
+	local VerifyInner, VerifyLabel, VerifyIcon = ButtonContent(VerifyBtn, "shield-check", "check", tostring(Auth.VerifyText), CButtonText, CButtonText)
+	local VerifySpin = Ic(VerifyInner, "loader", "info", {
+		Size = UDim2.new(0, IconSize, 0, IconSize), Color = CButtonText, LayoutOrder = IconRight and 2 or 1, Name = "Spinner",
+	})
+	if VerifySpin then VerifySpin.Instance.Visible = false end
+
+	local GetKeyBox = Custom:Create("Frame", {
+		AutomaticSize = Enum.AutomaticSize.Y, BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 7,
+		Size = UDim2.new(1, 0, 0, 0), Name = "GetKeyBox",
+	}, Main)
+	Custom:Create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, IsMini and 5 or 6) }, GetKeyBox)
+	local ProviderButtons = {}
+	local SectionHeaders = {}
+	local KeyButtonCount = 0
+	local BtnH = IsMini and 30 or 34
+	local LayoutCursor = 0
+	local HasFree, HasPremium = false, false
+	for _, P in ipairs(Providers) do
+		if P.Type == "Premium" then HasPremium = true else HasFree = true end
+	end
+	local function AddSectionHeader(Label, Order)
+		local Row = Custom:Create("Frame", {
+			BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = Order,
+			Size = UDim2.new(1, 0, 0, IsMini and 16 or 18), Name = "Section_" .. Label,
+		}, GetKeyBox)
+		SectionHeaders[Label] = Row
+		Custom:Label(Row, {
+			Font = FontBold, Text = string.upper(Label), TextColor3 = CSub, TextSize = IsMini and 9 or 10,
+			TextXAlignment = Enum.TextXAlignment.Left, Size = UDim2.new(1, 0, 1, 0), Name = "Label",
+		})
+	end
+	local function AddProviderButton(P, Order)
+		local Ready = P.GetKey ~= nil or (type(P.Url) == "string" and P.Url ~= "")
+		local Accent = P.Accent or CAccent
+		local B = Custom:Create("TextButton", {
+			Text = "", AutoButtonColor = false, BackgroundColor3 = CSecondary, BackgroundTransparency = Ready and 0.92 or 0.96, BorderSizePixel = 0,
+			ClipsDescendants = true, LayoutOrder = Order, Size = UDim2.new(1, 0, 0, BtnH), Name = "GetKey_" .. P.Id,
+		}, GetKeyBox)
+		Custom:Corner(B, IsMini and 7 or 8)
+		local BStroke = Custom:Stroke(B, P.Accent or CBorder, P.Accent and 0.55 or 0.8, 1)
+		local Text = P.ButtonText
+		if not Text then
+			Text = tostring(Auth.GetKeyText)
+			if #Providers > 1 and Auth.ShowProviderName ~= false then Text = Text .. " - " .. P.Name end
+		end
+		if IsMini and P.ButtonText == nil and #Providers == 1 then
+			Text = tostring(Auth.GetKeyText)
+		end
+		local _, BLabel, BIcon = ButtonContent(B, P.Logo or "link", "link", tostring(Text), Accent, Ready and CText or CSub)
+		HoverFx(B, BStroke, Ready and 0.92 or 0.96, 0.86, P.Accent and 0.55 or 0.8, P.Accent and 0.2 or 0.5)
+		table.insert(ProviderButtons, { Button = B, Provider = P, Ready = Ready })
+		KeyButtonCount = KeyButtonCount + 1
+	end
+	if AccessEnabled then
+		for _, P in ipairs(Providers) do
+			LayoutCursor = LayoutCursor + 1
+			AddProviderButton(P, LayoutCursor)
+		end
+	elseif GroupByType and HasFree and HasPremium then
+		LayoutCursor = LayoutCursor + 1
+		AddSectionHeader(PremiumLabel, LayoutCursor)
+		for _, P in ipairs(Providers) do
+			if P.Type == "Premium" then
+				LayoutCursor = LayoutCursor + 1
+				AddProviderButton(P, LayoutCursor)
+			end
+		end
+		LayoutCursor = LayoutCursor + 1
+		AddSectionHeader(FreeLabel, LayoutCursor)
+		for _, P in ipairs(Providers) do
+			if P.Type ~= "Premium" then
+				LayoutCursor = LayoutCursor + 1
+				AddProviderButton(P, LayoutCursor)
+			end
+		end
+	else
+		for _, P in ipairs(Providers) do
+			LayoutCursor = LayoutCursor + 1
+			AddProviderButton(P, LayoutCursor)
+		end
+	end
+
+	local KeylessRow = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 8,
+		Size = UDim2.new(1, 0, 0, 34), Visible = false, Name = "KeylessRow",
+	}, Main)
+	local KeylessBtn = Custom:Create("TextButton", {
+		Text = tostring(KeylessCfg.ButtonText or "Keyless Mode"), Font = FontBold, TextSize = 11,
+		TextColor3 = CText, BackgroundColor3 = CSecondary, BackgroundTransparency = 0.08,
+		BorderSizePixel = 0, AutoButtonColor = false, Size = UDim2.new(1, 0, 1, 0), Name = "KeylessButton",
+	}, KeylessRow)
+	Custom:Corner(KeylessBtn, 8)
+	Custom:Stroke(KeylessBtn, CBorder, 0.65, 1)
+	KeylessBtn.Visible = KeylessCfg.Enabled == true
+	KeylessRow.Visible = false
+
+	local HM = KeySys.HwidMode(Cfg)
+	local NoticeLines = {}
+	if HM ~= "Disabled" and Cfg.Device.Notice and Cfg.Device.Notice ~= "" then table.insert(NoticeLines, tostring(Cfg.Device.Notice)) end
+	if Cfg.AccountIndependent == false and Cfg.Account.Notice and Cfg.Account.Notice ~= "" then table.insert(NoticeLines, tostring(Cfg.Account.Notice)) end
+	local NoticeLabel = Custom:Label(Main, {
+		Font = FontBody, Text = table.concat(NoticeLines, " "), TextColor3 = CSub, TextSize = 10, TextWrapped = true,
+		AutomaticSize = Enum.AutomaticSize.Y, Size = UDim2.new(1, 0, 0, 12), LayoutOrder = 9, Visible = #NoticeLines > 0,
+		TextXAlignment = Enum.TextXAlignment.Center, Name = "Notice",
+	})
+
+	local DiscordRow = Custom:Create("Frame", {
+		BackgroundTransparency = 1, BorderSizePixel = 0, LayoutOrder = 10,
+			Size = UDim2.new(1, 0, 0, 22), Visible = DiscordCfg.Enabled ~= false, Name = "Discord",
+	}, Main)
+	local DiscordColor = Col(DiscordCfg.Color, Color3.fromRGB(88, 101, 242))
+	local DiscordBtn = nil
+	do
+		local Inner = Custom:Create("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), AutomaticSize = Enum.AutomaticSize.XY, BackgroundTransparency = 1, BorderSizePixel = 0,
+			Position = UDim2.new(0.5, 0, 0.5, 0), Size = UDim2.new(0, 0, 0, 0), Name = "Content",
+		}, DiscordRow)
+		Custom:Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, HorizontalAlignment = Enum.HorizontalAlignment.Center,
+			VerticalAlignment = Enum.VerticalAlignment.Center, SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 5),
+		}, Inner)
+		Custom:Label(Inner, {
+			Font = FontBody, Text = tostring(DiscordCfg.Text or ""), TextColor3 = CSub, TextSize = 11, AutomaticSize = Enum.AutomaticSize.X,
+			Size = UDim2.new(0, 0, 0, 18), LayoutOrder = 1, Visible = tostring(DiscordCfg.Text or "") ~= "", Name = "SupportText",
+		})
+		DiscordBtn = Custom:Create("TextButton", {
+			Text = "", AutoButtonColor = false, AutomaticSize = Enum.AutomaticSize.X, BackgroundTransparency = 1, BorderSizePixel = 0,
+			LayoutOrder = 2, Size = UDim2.new(0, 0, 0, 22), Name = "DiscordButton",
+		}, Inner)
+		Custom:Create("UIListLayout", {
+			FillDirection = Enum.FillDirection.Horizontal, VerticalAlignment = Enum.VerticalAlignment.Center,
+			SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4),
+		}, DiscordBtn)
+		local DSize = math.clamp(tonumber(DiscordCfg.IconSize) or 14, 8, 24)
+		if DiscordCfg.Icon ~= false then
+			Ic(DiscordBtn, DiscordCfg.Icon or "message-circle", "message-circle", {
+				Size = UDim2.new(0, DSize, 0, DSize), Color = DiscordColor, LayoutOrder = 1, Name = "DiscordIcon",
+			})
+		end
+		local DLabel = Custom:Label(DiscordBtn, {
+			Font = FontBold, Text = tostring(DiscordCfg.LinkText or "Discord"), TextColor3 = DiscordColor, TextSize = 11,
+			AutomaticSize = Enum.AutomaticSize.X, Size = UDim2.new(0, 0, 0, 18), LayoutOrder = 2, Name = "DiscordText",
+		})
+		local Bright = DiscordColor:Lerp(Theme.White, 0.3)
+		Track(DiscordBtn.MouseEnter:Connect(function() Anim(DLabel, 0.12, { TextColor3 = Bright }) end))
+		Track(DiscordBtn.MouseLeave:Connect(function() Anim(DLabel, 0.18, { TextColor3 = DiscordColor }) end))
+		Track(DiscordBtn.MouseButton1Down:Connect(function() Anim(DLabel, 0.08, { TextTransparency = 0.5 }) end))
+		Track(DiscordBtn.MouseButton1Up:Connect(function() Anim(DLabel, 0.15, { TextTransparency = 0 }) end))
+	end
+
+	local function Spin(Inst, On)
+		if not Inst then return end
+		local Cur = Spinners[Inst]
+		if Cur then pcall(function() Cur:Cancel() end) end
+		Spinners[Inst] = nil
+		Inst.Rotation = 0
+	end
+
+	local function SetStatus(Kind, Text)
+		if Destroyed then return end
+		local Def = StatusDefs[Kind]
+		for K, Obj in pairs(StatusIcons) do
+			Obj.Instance.Visible = (K == Kind)
+			if K ~= "loading" then Spin(Obj.Instance, false) end
+		end
+		if StatusIcons.loading then Spin(StatusIcons.loading.Instance, Kind == "loading") end
+		StatusLabel.Text = tostring(Text or "")
+		StatusLabel.TextColor3 = Def and Def[2] or CSub
+		StatusLabel.TextTransparency = 1
+		Anim(StatusLabel, 0.18, { TextTransparency = 0 })
+	end
+
+	local function TierHasProviders(Tier)
+		for _, Entry in ipairs(ProviderButtons) do
+			if Entry.Provider.Type == Tier then return true end
+		end
+		return false
+	end
+
+	local function UpdateAccessUI()
+		if not AccessEnabled then
+			GetKeyBox.Visible = Mode == "API" and KeyButtonCount > 0
+			return
+		end
+		local IsPremium = AccessTier == "Premium"
+		local ActiveAccent = IsPremium and PremiumAccent or FreeAccent
+		if AccessSlider then
+			Anim(AccessSlider, 0.2, {
+				Position = IsPremium and UDim2.new(0.5, 2, 0, 3) or UDim2.fromOffset(3, 3),
+				BackgroundColor3 = ActiveAccent,
+			})
+		end
+		if FreeModeBtn then FreeModeBtn.TextColor3 = IsPremium and CSub or Theme.Black end
+		if PremiumModeBtn then PremiumModeBtn.TextColor3 = IsPremium and Theme.Black or CSub end
+		for _, Entry in ipairs(ProviderButtons) do
+			Entry.Button.Visible = Entry.Provider.Type == AccessTier
+		end
+		InputBox.PlaceholderText = tostring(IsPremium and AccessCfg.PremiumPlaceholder or AccessCfg.FreePlaceholder)
+		VerifyLabel.Text = tostring(IsPremium and AccessCfg.PremiumVerifyText or AccessCfg.FreeVerifyText)
+		VerifyBtn.BackgroundColor3 = ActiveAccent
+		if VerifyStroke then VerifyStroke.Color = ActiveAccent end
+		local KeylessVisible = AccessTier == "Free" and KeylessCfg.Enabled == true
+		KeylessRow.Visible = KeylessVisible
+		local HideEntry = KeylessVisible and KeylessCfg.HideFreeKeyEntry ~= false
+		InputFrame.Visible = not HideEntry
+		VerifyBtn.Visible = not HideEntry
+		GetKeyBox.Visible = Mode == "API" and TierHasProviders(AccessTier) and not HideEntry
+		if KeylessBtn then KeylessBtn.Visible = KeylessVisible end
+		if not Busy then
+			local Description = tostring(IsPremium and AccessCfg.PremiumDescription or AccessCfg.FreeDescription or "")
+			SetStatus("idle", Description)
+		end
+	end
+
+	local function SetAccessTier(NewTier)
+		if not AccessEnabled then return false end
+		AccessTier = string.lower(tostring(NewTier or "Free")) == "premium" and "Premium" or "Free"
+		UpdateAccessUI()
+		return true
+	end
+
+	local function SetBusy(On, Verifying)
+		Busy = On
+		if Destroyed then return end
+		InputBox.TextEditable = not On
+		if Verifying then
+			local IdleVerifyText = Auth.VerifyText
+			if AccessEnabled then
+				IdleVerifyText = AccessTier == "Premium" and AccessCfg.PremiumVerifyText or AccessCfg.FreeVerifyText
+			end
+			VerifyLabel.Text = On and tostring(Auth.LoadingText) or tostring(IdleVerifyText)
+			if VerifyIcon then VerifyIcon.Instance.Visible = not On end
+			if VerifySpin then
+				VerifySpin.Instance.Visible = On
+				Spin(VerifySpin.Instance, On)
+			end
+		end
+		Anim(VerifyBtn, 0.15, { BackgroundTransparency = On and 0.4 or 0 })
+		for _, Entry in ipairs(ProviderButtons) do
+			Anim(Entry.Button, 0.15, { BackgroundTransparency = (On or not Entry.Ready) and 0.96 or 0.92 })
+		end
+	end
+
+	local PersistFolder = CleanName(tostring(PersistCfg.Folder or "YOUR_LIBRARY_NAME"))
+	local PersistDirectory = PersistFolder .. "/KeySystem"
+
+	local function PersistPath()
+		return PersistDirectory .. "/" .. CleanName(tostring(PersistCfg.Name or "YOUR_CONFIG_NAME")) .. ".json"
+	end
+
+	local function SavePersist(Key)
+		if PersistCfg.Enabled ~= true or not FsReady() then return end
+		pcall(function()
+			if makefolder and isfolder then
+				if not isfolder(PersistFolder) then makefolder(PersistFolder) end
+				if not isfolder(PersistDirectory) then makefolder(PersistDirectory) end
+			end
+			writefile(PersistPath(), HttpService:JSONEncode({ Key = Key, Mode = Mode, AccessTier = AccessTier, Time = os.time() }))
+		end)
+	end
+
+	local function ClearPersist()
+		if not FsReady() then return end
+		pcall(function()
+			if isfile(PersistPath()) and delfile then delfile(PersistPath()) end
+		end)
+	end
+
+	local function LoadPersist()
+		if PersistCfg.Enabled ~= true or not FsReady() then return nil end
+		local Ok, Data = pcall(function()
+			if not isfile(PersistPath()) then return nil end
+			return HttpService:JSONDecode(readfile(PersistPath()))
+		end)
+		if not Ok or type(Data) ~= "table" or type(Data.Key) ~= "string" or Data.Key == "" then return nil end
+		local Days = tonumber(PersistCfg.Days) or 0
+		if Days > 0 and (os.time() - (tonumber(Data.Time) or 0)) > Days * 86400 then return nil end
+		return Data
+	end
+
+	local function Reject(Reason, Text, Key, IsInvalid)
+		LastFail = os.clock()
+		if PersistTrial then
+			PersistTrial = false
+			ClearPersist()
+		end
+		SetBusy(false, true)
+		SetStatus("error", Text)
+		Notify("error", Text)
+		if IsInvalid then Fire("OnKeyRejected", Key, Reason) end
+		Fire("OnFailure", Text, Reason)
+	end
+
+	local function Accept(Key, Info)
+		if Verified then return end
+		Verified = true
+		PersistTrial = false
+		SetBusy(false, true)
+		local Text = tostring(Auth.SuccessText or "Key verified.")
+		SetStatus("success", Text)
+		Notify("success", Text)
+		SavePersist(Key)
+		Fire("OnKeyAccepted", Key, Info)
+		task.delay(tonumber(Behavior.SuccessDelay) or 0.9, function()
+			if SuccessFired then return end
+			SuccessFired = true
+			Fire("OnSuccess", Key, Info)
+			if Behavior.CloseOnSuccess ~= false and not Destroyed then Self:Destroy() end
+		end)
+	end
+
+	local Timeout = math.clamp(tonumber(Auth.Timeout) or 10, 2, 60)
+	local RetryCfg = type(Auth.Retry) == "table" and Auth.Retry or {}
+	local RetryAttempts = math.clamp(math.floor(tonumber(RetryCfg.Attempts) or 0), 0, 5)
+	local RetryDelay = math.clamp(tonumber(RetryCfg.Delay) or 1.5, 0.2, 15)
+	local Cooldown = math.clamp(tonumber(Auth.Cooldown) or 1, 0, 30)
+
+	local function VerifyPassword(Key)
+		local Raw = PwCfg.Password
+		local List = {}
+		if type(Raw) == "string" then
+			if Raw ~= "" then table.insert(List, Raw) end
+		elseif type(Raw) == "table" then
+			for _, V in ipairs(Raw) do
+				if type(V) == "string" and V ~= "" then table.insert(List, V) end
+			end
+		end
+		if #List == 0 then
+			Reject("not_configured", Msg.NotConfigured, Key)
+			return
+		end
+		local Sensitive = PwCfg.CaseSensitive ~= false
+		local Probe = Sensitive and Key or string.lower(Key)
+		for _, V in ipairs(List) do
+			if (Sensitive and V or string.lower(V)) == Probe then
+				Accept(Key, { Mode = "Password" })
+				return
+			end
+		end
+		Reject("invalid", Msg.Invalid, Key, true)
+	end
+
+	local function CollectVerifiers()
+		local List = {}
+		if type(API.Verify) == "function" then table.insert(List, { Fn = API.Verify, Timeout = Timeout }) end
+		if type(API.VerifyUrl) == "table" then table.insert(List, { Fn = KeySys.MakeUrlVerifier(API.VerifyUrl), Timeout = Timeout }) end
+		for _, P in ipairs(Providers) do
+			if not AccessEnabled or P.Type == AccessTier then
+				if P.Verify then table.insert(List, { Fn = P.Verify, Provider = P, Timeout = P.Timeout or Timeout }) end
+				if P.VerifyUrl then table.insert(List, { Fn = KeySys.MakeUrlVerifier(P.VerifyUrl), Provider = P, Timeout = P.Timeout or Timeout }) end
+			end
+		end
+		return List
+	end
+
+	local function VerifyApi(Key)
+		local Verifiers = CollectVerifiers()
+		if #Verifiers == 0 then
+			Reject("not_configured", Msg.NotConfigured, Key)
+			return
+		end
+		local Context = KeySys.BuildContext(Cfg, Key, "API", AccessEnabled and AccessTier or nil)
+		if Context.Policy.HWIDMode == "Strict" and not Context.HWID then
+			Reject("device_unavailable", Msg.DeviceUnavailable, Key)
+			return
+		end
+		local Index = 1
+		local AnyError, LastKind = false, "api_error"
+		local Step
+		local function Advance()
+			Index = Index + 1
+			Step()
+		end
+		Step = function()
+			if Dead() then return end
+			local Entry = Verifiers[Index]
+			if not Entry then
+				if AnyError then
+					if LastKind == "timeout" then Reject("timeout", Msg.Timeout, Key) else Reject("api_error", Msg.ApiError, Key) end
+				else
+					Reject("invalid", Msg.Invalid, Key, true)
+				end
+				return
+			end
+			local Attempt = 0
+			local function Try()
+				Attempt = Attempt + 1
+				local Ctx = KeySys.WithProvider(Context, Entry.Provider)
+				KeySys.RunWithTimeout(Entry.Timeout, function() return Entry.Fn(Key, Ctx) end, function(Status, Ok, Meta)
+					if Dead() then return end
+					if Status == "done" and Ok == true then
+						local ReturnedTier = nil
+						if type(Meta) == "string" then ReturnedTier = Meta
+						elseif type(Meta) == "table" then
+							ReturnedTier = Meta.tier or Meta.Tier or Meta.accessTier or Meta.AccessTier
+							if ReturnedTier == nil and type(Meta.premium) == "boolean" then ReturnedTier = Meta.premium and "Premium" or "Free" end
+						end
+						if AccessEnabled and ReturnedTier ~= nil and string.lower(tostring(ReturnedTier)) ~= string.lower(AccessTier) then
+							Reject("wrong_tier", Msg.WrongTier, Key, true)
+							return
+						end
+						Accept(Key, { Mode = "API", Provider = Entry.Provider and Entry.Provider.Id or nil, AccessTier = AccessEnabled and AccessTier or nil, Response = Meta })
+						return
+					end
+					if Status == "done" and Ok == false then
+						Advance()
+						return
+					end
+					AnyError = true
+					LastKind = Status == "timeout" and "timeout" or "api_error"
+					if Attempt <= RetryAttempts then
+						task.delay(RetryDelay, function()
+							if not Dead() then Try() end
+						end)
+					else
+						Advance()
+					end
+				end)
+			end
+			Try()
+		end
+		Step()
+	end
+
+	local function RunKeyless()
+		if Dead() or not AccessEnabled or AccessTier ~= "Free" or KeylessCfg.Enabled ~= true then return false end
+		if Busy then
+			SetStatus("warning", Msg.Busy)
+			return false
+		end
+		local Callback = type(KeylessCfg.Callback) == "function" and KeylessCfg.Callback or Callbacks.OnKeyless
+		if type(Callback) ~= "function" then
+			local Text = tostring(Msg.NotConfigured)
+			SetStatus("warning", Text)
+			Notify("warning", Text)
+			Fire("OnFailure", Text, "keyless_not_configured")
+			return false
+		end
+		SetBusy(true, false)
+		SetStatus("loading", tostring(KeylessCfg.LoadingText or "Loading Keyless..."))
+		local Context = KeySys.BuildContext(Cfg, "", "Keyless", AccessTier)
+		KeySys.RunWithTimeout(math.clamp(tonumber(KeylessCfg.Timeout) or 20, 2, 120), function()
+			return Callback(Context)
+		end, function(Status, Result, Detail)
+			if Dead() then return end
+			SetBusy(false, false)
+			if Status == "done" and Result ~= false then
+				local Text = tostring(KeylessCfg.SuccessText or "Keyless access granted.")
+				SetStatus("success", Text)
+				Notify("success", Text)
+				Fire("OnKeylessSuccess", Context, Result, Detail)
+				if KeylessCfg.CloseOnSuccess ~= false and Behavior.CloseOnSuccess ~= false then
+					task.delay(tonumber(Behavior.SuccessDelay) or 0.5, function()
+						if not Dead() then Self:Destroy() end
+					end)
+				end
+			else
+				local Text = Status == "timeout" and tostring(Msg.Timeout) or tostring(Detail or Result or Msg.ApiError)
+				SetStatus("error", Text)
+				Notify("error", Text)
+				Fire("OnFailure", Text, Status == "timeout" and "timeout" or "keyless_failed")
+			end
+		end)
+		return true
+	end
+
+	local function StartVerify(Raw)
+		if Dead() or Verified then return end
+		if Busy then
+			SetStatus("warning", Msg.Busy)
+			return
+		end
+		if os.clock() - LastFail < Cooldown then
+			SetStatus("warning", Msg.Cooldown)
+			return
+		end
+		if not ApiOn and not PwOn then
+			Reject("no_method", Msg.NoMethod, "")
+			return
+		end
+		local Key = tostring(Raw or "")
+		if Auth.Trim ~= false then Key = KeySys.Trim(Key) end
+		if Key == "" then
+			SetStatus("warning", Msg.Empty)
+			Notify("warning", Msg.Empty)
+			Fire("OnFailure", Msg.Empty, "empty")
+			return
+		end
+		if #Key > (tonumber(Auth.MaxLength) or 512) then
+			Reject("invalid", Msg.Invalid, Key, true)
+			return
+		end
+		SetBusy(true, true)
+		SetStatus("loading", Auth.LoadingText)
+		local Ok, Err = pcall(function()
+			if Mode == "Password" then VerifyPassword(Key) else VerifyApi(Key) end
+		end)
+		if not Ok then
+			warn("[KeySystemTemplate] verification error: " .. tostring(Err))
+			Reject("api_error", Msg.ApiError, Key)
+		end
+	end
+
+	local function CopyOrFallback(Url)
+		if KeySys.Copy(Url) then
+			SetStatus("info", Msg.Copied)
+			Notify("success", Msg.Copied)
+			return true
+		end
+		local Fallback = string.lower(tostring(Behavior.ClipboardFallback or "show"))
+		if Fallback == "show" then
+			LinkBox.Text = Url
+			LinkBox.Visible = true
+		end
+		local Text = tostring(Msg.ClipboardFailed)
+		if Fallback == "notify" then Text = Text .. " " .. Url end
+		SetStatus("warning", Text)
+		Notify("warning", Text)
+		return false
+	end
+
+	local function RequestKey(P)
+		if Dead() or Verified then return false end
+		if AccessEnabled and P.Type ~= AccessTier then return false end
+		if Busy then
+			SetStatus("warning", Msg.Busy)
+			return false
+		end
+		local HasUrl = type(P.Url) == "string" and P.Url ~= ""
+		if not P.GetKey and not HasUrl then
+			SetStatus("warning", Msg.ProviderMissing)
+			Notify("warning", Msg.ProviderMissing)
+			Fire("OnFailure", Msg.ProviderMissing, "not_configured")
+			return false
+		end
+		SetBusy(true, false)
+		SetStatus("loading", Auth.GetKeyLoadingText)
+		LinkBox.Visible = false
+
+		local function Deliver(Result)
+			if Dead() then return end
+			SetBusy(false, false)
+			local Url, KeyValue = nil, nil
+			if type(Result) == "string" then
+				Url = Result
+			elseif type(Result) == "table" then
+				Url = Result.Url
+				KeyValue = Result.Key
+			end
+			if type(Url) == "string" and not string.match(Url, "^https?://") then Url = nil end
+			if type(KeyValue) == "string" and KeyValue ~= "" then
+				InputBox.Text = KeyValue
+				SetStatus("info", Msg.KeyReceived)
+				Notify("info", Msg.KeyReceived)
+			end
+			if Url then CopyOrFallback(Url) end
+			if not Url and not (type(KeyValue) == "string" and KeyValue ~= "") then
+				Reject("api_error", Msg.ApiError, "")
+				return
+			end
+			Fire("OnGetKey", P.Id, Url)
+		end
+
+		if not P.GetKey then
+			Deliver(P.Url)
+			return true
+		end
+		local Context = KeySys.WithProvider(KeySys.BuildContext(Cfg, "", "API", AccessEnabled and AccessTier or nil), P)
+		local Attempt = 0
+		local function Try()
+			Attempt = Attempt + 1
+			KeySys.RunWithTimeout(P.Timeout or Timeout, function() return P.GetKey(Context) end, function(Status, Result)
+				if Dead() then return end
+				if Status == "done" and Result ~= nil then
+					Deliver(Result)
+					return
+				end
+				if Attempt <= RetryAttempts then
+					task.delay(RetryDelay, function()
+						if not Dead() then Try() end
+					end)
+				elseif Status == "timeout" then
+					Reject("timeout", Msg.Timeout, "")
+				else
+					Reject("api_error", Msg.ApiError, "")
+				end
+			end)
+		end
+		Try()
+		return true
+	end
+
+	local function SetMode(NewMode)
+		NewMode = string.lower(tostring(NewMode)) == "password" and "Password" or "API"
+		if NewMode == "Password" and not PwOn then return false end
+		if NewMode == "API" and not ApiOn then return false end
+		Mode = NewMode
+		for Name, Obj in pairs(InputIcons) do Obj.Instance.Visible = (Name == Mode) end
+		if not AccessEnabled then
+			InputBox.PlaceholderText = tostring(Mode == "Password" and Auth.PasswordPlaceholder or Auth.Placeholder)
+		end
+		UpdateAccessUI()
+		LinkBox.Visible = false
+		if not Busy and not Verified and not AccessEnabled then SetStatus("idle", "") end
+		return true
+	end
+
+	local function CloseWindow()
+		if Dead() then return end
+		local Behaviour = string.lower(tostring(Win.CloseBehavior or "destroy"))
+		Fire("OnClose")
+		if Behaviour == "hide" then
+			Self:Hide()
+		elseif Behaviour ~= "callback" then
+			Self:Destroy()
+		end
+	end
+
+	local function ApplyFit()
+		if Destroyed then return end
+		local Screen, Size, Cur = Gui.AbsoluteSize, Main.AbsoluteSize, UIScaleObj.Scale
+		if Screen.X <= 0 or Screen.Y <= 0 or Size.X <= 0 or Size.Y <= 0 or Cur <= 0 then return end
+		local NatW, NatH = Size.X / Cur, Size.Y / Cur
+		TargetScale = math.clamp(math.min(tonumber(Win.Scale) or 1, (Screen.X * 0.94) / NatW, (Screen.Y * 0.9) / NatH), 0.4, 1.5)
+		if not Intro and math.abs(TargetScale - Cur) > 0.004 then UIScaleObj.Scale = TargetScale end
+	end
+
+	local function TeardownNow()
+		if Destroyed then return end
+		Destroyed = true
+		for _, C in ipairs(Conns) do pcall(function() C:Disconnect() end) end
+		for _, T in ipairs(Tweens) do pcall(function() T:Cancel() end) end
+		for _, T in pairs(Spinners) do pcall(function() T:Cancel() end) end
+		table.clear(Spinners)
+		pcall(function() Gui:Destroy() end)
+		if Rexxzy_Library.ActiveKeySystem == Self then Rexxzy_Library.ActiveKeySystem = nil end
+	end
+
+	function Self:Destroy(Instant)
+		if Destroyed or Closing then return end
+		Closing = true
+		if AnimOn and Instant ~= true and Main.Parent then
+			Anim(UIScaleObj, 0.15, { Scale = UIScaleObj.Scale * 0.92 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+			Anim(Backdrop, 0.15, { BackgroundTransparency = 1 })
+			task.delay(0.17 * Mult, TeardownNow)
+		else
+			TeardownNow()
+		end
+	end
+
+	function Self:Close() CloseWindow() end
+	function Self:Show()
+		if Dead() then return end
+		Main.Visible = true
+		Backdrop.Visible = true
+		task.defer(ApplyFit)
+	end
+	function Self:Hide()
+		if Dead() then return end
+		Main.Visible = false
+		Backdrop.Visible = false
+	end
+	function Self:SetTitle(Text) if not Destroyed then TitleLabel.Text = tostring(Text) end end
+	function Self:SetDescription(Text)
+		if Destroyed then return end
+		DescLabel.Text = tostring(Text or "")
+		DescLabel.Visible = DescLabel.Text ~= ""
+	end
+	function Self:SetStatus(Kind, Text) SetStatus(Kind, Text) end
+	function Self:SetMode(NewMode) return SetMode(NewMode) end
+	function Self:GetMode() return Mode end
+	function Self:SetAccessTier(Tier) return SetAccessTier(Tier) end
+	function Self:GetAccessTier() return AccessTier end
+	function Self:RunKeyless() return RunKeyless() end
+	function Self:SetKey(Text) if not Destroyed then InputBox.Text = tostring(Text or "") end end
+	function Self:GetInput() return Destroyed and "" or InputBox.Text end
+	function Self:Verify(Key)
+		if Key ~= nil and not Destroyed then InputBox.Text = tostring(Key) end
+		StartVerify(Destroyed and "" or InputBox.Text)
+	end
+	function Self:RequestKey(ProviderId)
+		for _, P in ipairs(Providers) do
+			if P.Id == ProviderId then return RequestKey(P) end
+		end
+		return false
+	end
+	function Self:IsVerified() return Verified end
+	function Self:ClearSaved() ClearPersist() end
+	function Self:IsDestroyed() return Destroyed or Closing end
+	Self.Frame = Main
+	Self.Gui = Gui
+
+	if CloseBtn then
+		Track(CloseBtn.Activated:Connect(function()
+			CircleClick(CloseBtn)
+			CloseWindow()
+		end))
+	end
+	Track(VerifyBtn.Activated:Connect(function()
+		CircleClick(VerifyBtn)
+		StartVerify(InputBox.Text)
+	end))
+	if FreeModeBtn then
+		Track(FreeModeBtn.Activated:Connect(function()
+			if not Busy then SetAccessTier("Free") end
+		end))
+	end
+	if PremiumModeBtn then
+		Track(PremiumModeBtn.Activated:Connect(function()
+			if not Busy then SetAccessTier("Premium") end
+		end))
+	end
+	if PasteBtn then
+		Track(PasteBtn.Activated:Connect(function()
+			local Getter = getclipboard or readclipboard or (Clipboard and Clipboard.get)
+			if type(Getter) ~= "function" then
+				SetStatus("warning", tostring(Msg.ClipboardFailed))
+				return
+			end
+			local Ok, Value = pcall(Getter)
+			local Text = Ok and tostring(Value or "") or ""
+			Text = string.gsub(Text, "[%c%z]", "")
+			Text = KeySys.Trim(Text):sub(1, math.clamp(tonumber(Auth.MaxLength) or 512, 1, 2048))
+			if Text ~= "" then
+				InputBox.Text = Text
+				SetStatus("info", tostring(Msg.KeyReceived or "Key pasted."))
+			else
+				SetStatus("warning", tostring(Msg.ClipboardFailed))
+			end
+		end))
+	end
+	if KeylessBtn then
+		Track(KeylessBtn.Activated:Connect(function()
+			CircleClick(KeylessBtn)
+			RunKeyless()
+		end))
+	end
+	HoverFx(VerifyBtn, nil, 0, 0.12, 0, 0)
+	for _, Entry in ipairs(ProviderButtons) do
+		Track(Entry.Button.Activated:Connect(function()
+			CircleClick(Entry.Button)
+			RequestKey(Entry.Provider)
+		end))
+	end
+	if DiscordBtn then
+		Track(DiscordBtn.Activated:Connect(function()
+			if Dead() then return end
+			local Url = tostring(DiscordCfg.InviteURL or "")
+			if Url == "" then
+				SetStatus("warning", DiscordCfg.MissingMessage)
+				Notify("warning", DiscordCfg.MissingMessage)
+				return
+			end
+			if KeySys.Copy(Url) then
+				SetStatus("info", DiscordCfg.CopiedMessage)
+				Notify("success", DiscordCfg.CopiedMessage)
+			else
+				local Fallback = string.lower(tostring(Behavior.ClipboardFallback or "show"))
+				if Fallback == "show" then
+					LinkBox.Text = Url
+					LinkBox.Visible = true
+				end
+				local Text = tostring(Msg.ClipboardFailed)
+				if Fallback == "notify" then Text = Text .. " " .. Url end
+				SetStatus("warning", Text)
+				Notify("warning", Text)
+			end
+		end))
+	end
+	Track(InputBox.Focused:Connect(function()
+		Anim(InputStroke, 0.15, { Transparency = 0.3 })
+		if UserInputService.TouchEnabled then Anim(Main, 0.2, { Position = UDim2.new(BasePos.X.Scale, BasePos.X.Offset, 0.3, 0) }) end
+	end))
+	Track(InputBox.FocusLost:Connect(function(Enter)
+		Anim(InputStroke, 0.2, { Transparency = 0.85 })
+		if UserInputService.TouchEnabled then Anim(Main, 0.2, { Position = BasePos }) end
+		if Enter then StartVerify(InputBox.Text) end
+	end))
+	Track(LinkBox.Focused:Connect(function()
+		pcall(function()
+			LinkBox.SelectionStart = 1
+			LinkBox.CursorPosition = #LinkBox.Text + 1
+		end)
+	end))
+	Track(Main:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() if not Intro then ApplyFit() end end))
+	Track(Gui:GetPropertyChangedSignal("AbsoluteSize"):Connect(function() if not Intro then ApplyFit() end end))
+
+	if not SetMode(Mode) then
+		InputBox.PlaceholderText = tostring(Auth.Placeholder)
+		if InputIcons.Password then InputIcons.Password.Instance.Visible = false end
+		GetKeyBox.Visible = false
+	end
+	if AccessEnabled then SetAccessTier(AccessTier) end
+	if not ApiOn and not PwOn then SetStatus("warning", Msg.NoMethod) end
+
+	task.spawn(function()
+		task.wait()
+		if Destroyed then return end
+		ApplyFit()
+		if AnimOn then
+			UIScaleObj.Scale = TargetScale * 0.92
+			Anim(Backdrop, 0.25, { BackgroundTransparency = BackdropGoal })
+			local Tw = Anim(UIScaleObj, 0.28, { Scale = TargetScale }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+			if Tw then Tw.Completed:Wait() end
+		else
+			UIScaleObj.Scale = TargetScale
+			Backdrop.BackgroundTransparency = BackdropGoal
+		end
+		if Destroyed then return end
+		Intro = false
+		ApplyFit()
+		local Saved = LoadPersist()
+		if Saved and PersistCfg.AutoVerify ~= false then
+			local SavedMode = Saved.Mode == "Password" and "Password" or "API"
+			if (SavedMode == "Password" and PwOn) or (SavedMode == "API" and ApiOn) then
+				if AccessEnabled and Saved.AccessTier ~= nil then SetAccessTier(Saved.AccessTier) end
+				SetMode(SavedMode)
+				InputBox.Text = Saved.Key
+				PersistTrial = true
+				StartVerify(Saved.Key)
+			end
+		end
+	end)
+
+	return Self
+end
+
+function Rexxzy_Library:CreateKaitunGui(UserConfig)
+	UserConfig = type(UserConfig) == "table" and UserConfig or {}
+
+	local function Col(V, D)
+		return typeof(V) == "Color3" and V or D
+	end
+
+	local Cfg = {
+		Title = UserConfig.Title or UserConfig[1] or "Kaitun Auto Farm",
+		Status = UserConfig.Status or UserConfig[2] or "Waiting for teleport...",
+		Logo = UserConfig.Logo or UserConfig.Icon or RexxzyLogos.Veloria or RexxzyLogos.VH or "rbxassetid://131946786209484",
+		LogoSize = math.clamp(tonumber(UserConfig.LogoSize) or 86, 40, 180),
+		Subtitle = UserConfig.Subtitle or "",
+
+		Background = Col(UserConfig.Background, Theme.Black),
+		BackgroundTransparency = typeof(UserConfig.BackgroundTransparency) == "number" and UserConfig.BackgroundTransparency or 0,
+		Accent = Col(UserConfig.Accent, Theme.White),
+		Text = Col(UserConfig.Text, Theme.Text),
+		SubText = Col(UserConfig.SubText, Theme.Sub),
+		ProgressColor = Col(UserConfig.ProgressColor, Theme.White),
+		ProgressTrack = Col(UserConfig.ProgressTrack, Color3.fromRGB(40, 40, 40)),
+
+		Timer = type(UserConfig.Timer) == "table" and UserConfig.Timer or {
+			Enabled = UserConfig.Timer ~= false,
+			Seconds = tonumber(UserConfig.Timer) or 0,
+			CountDown = true,
+			Format = "mm:ss",
+		},
+		Progress = type(UserConfig.Progress) == "table" and UserConfig.Progress or {
+			Enabled = UserConfig.Progress ~= false,
+			Value = tonumber(UserConfig.Progress) or 0,
+			ShowPercent = true,
+			Height = 4,
+		},
+		Discord = type(UserConfig.Discord) == "table" and UserConfig.Discord or {
+			Enabled = UserConfig.Discord ~= false and (UserConfig.DiscordUrl or UserConfig.Discord) ~= nil,
+			Text = "Join Discord",
+			Url = typeof(UserConfig.Discord) == "string" and UserConfig.Discord or (UserConfig.DiscordUrl or ""),
+			Color = Color3.fromRGB(160, 160, 160),
+		},
+
+		IgnoreGuiInset = UserConfig.IgnoreGuiInset ~= false,
+		DisplayOrder = math.clamp(tonumber(UserConfig.DisplayOrder) or 250, 1, 999),
+		ZIndexBehavior = UserConfig.ZIndexBehavior or Enum.ZIndexBehavior.Sibling,
+		Animations = false, -- Static UI: never animate the status/Kaitun window.
+		CloseOnClick = UserConfig.CloseOnClick == true,
+		Name = tostring(UserConfig.Name or "RexxzyKaitunGui"),
+	}
+
+	if type(Cfg.Timer) ~= "table" then
+		Cfg.Timer = { Enabled = true, Seconds = tonumber(Cfg.Timer) or 0, CountDown = true, Format = "mm:ss" }
+	end
+	Cfg.Timer.Enabled = Cfg.Timer.Enabled ~= false
+	Cfg.Timer.Seconds = math.max(0, tonumber(Cfg.Timer.Seconds) or 0)
+	Cfg.Timer.CountDown = Cfg.Timer.CountDown ~= false
+	Cfg.Timer.Format = tostring(Cfg.Timer.Format or "mm:ss")
+
+	if type(Cfg.Progress) ~= "table" then
+		Cfg.Progress = { Enabled = true, Value = tonumber(Cfg.Progress) or 0, ShowPercent = true, Height = 4 }
+	end
+	Cfg.Progress.Enabled = Cfg.Progress.Enabled ~= false
+	Cfg.Progress.Value = math.clamp(tonumber(Cfg.Progress.Value) or 0, 0, 1)
+	Cfg.Progress.ShowPercent = Cfg.Progress.ShowPercent ~= false
+	Cfg.Progress.Height = math.clamp(tonumber(Cfg.Progress.Height) or 4, 2, 12)
+
+	if type(Cfg.Discord) ~= "table" then
+		Cfg.Discord = { Enabled = false, Text = "Join Discord", Url = "", Color = Color3.fromRGB(160, 160, 160) }
+	end
+	Cfg.Discord.Enabled = Cfg.Discord.Enabled ~= false and tostring(Cfg.Discord.Url or "") ~= ""
+	Cfg.Discord.Text = tostring(Cfg.Discord.Text or "Join Discord")
+	Cfg.Discord.Url = tostring(Cfg.Discord.Url or "")
+	Cfg.Discord.Color = Col(Cfg.Discord.Color, Color3.fromRGB(160, 160, 160))
+
+	local Self = {}
+	local Conns, Tweens = {}, {}
+	local Destroyed, Closing = false, false
+	local CurrentProgress = Cfg.Progress.Value
+	local CurrentSeconds = Cfg.Timer.Seconds
+	local TimerRunning = false
+
+	local function Dead() return Destroyed or Closing end
+	local function Track(C) table.insert(Conns, C) return C end
+	local function Anim(Inst, Time, Props, Style, Dir)
+		if not Inst or not Inst.Parent then return nil end
+		if Cfg.Animations then
+			local Tw = Custom:Tween(Inst, Time or 0.25, Props, Style, Dir)
+			table.insert(Tweens, Tw)
+			return Tw
+		end
+		for K, V in pairs(Props) do Inst[K] = V end
+		return nil
+	end
+
+	local function FormatTime(Sec)
+		Sec = math.max(0, math.floor(Sec + 0.5))
+		local M = math.floor(Sec / 60)
+		local S = Sec % 60
+		if Cfg.Timer.Format == "ss" then
+			return string.format("%02d", Sec)
+		end
+		return string.format("%02d:%02d", M, S)
+	end
+
+	local Gui = Custom:Create("ScreenGui", {
+		Name = Cfg.Name,
+		ResetOnSpawn = false,
+		IgnoreGuiInset = Cfg.IgnoreGuiInset,
+		DisplayOrder = Cfg.DisplayOrder,
+		ZIndexBehavior = Cfg.ZIndexBehavior,
+	}, Custom:GetGuiParent())
+
+	local Root = Custom:Create("Frame", {
+		Name = "Root",
+		BackgroundColor3 = Cfg.Background,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0),
+		ClipsDescendants = true,
+	}, Gui)
+
+	local Center = Custom:Create("Frame", {
+		Name = "Center",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.48, 0),
+		Size = UDim2.new(0, 340, 0, 280),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 5,
+	}, Root)
+
+	Custom:Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Vertical,
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 10),
+	}, Center)
+
+	local TimerLabel = Custom:Label(Center, {
+		Name = "Timer",
+		LayoutOrder = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = Cfg.Timer.Enabled and FormatTime(CurrentSeconds) or "",
+		TextColor3 = Cfg.SubText,
+		TextSize = 13,
+		TextTransparency = 0.15,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Size = UDim2.new(1, 0, 0, 18),
+		Visible = Cfg.Timer.Enabled,
+	})
+
+	local LogoHold = Custom:Create("Frame", {
+		Name = "LogoHold",
+		LayoutOrder = 2,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(0, Cfg.LogoSize, 0, Cfg.LogoSize),
+	}, Center)
+	local LogoScale = Custom:Create("UIScale", { Scale = 1 }, LogoHold)
+	local LogoImg = Custom:Create("ImageLabel", {
+		Name = "Logo",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0),
+		Image = tostring(Cfg.Logo),
+		ImageColor3 = Cfg.Accent,
+		ImageTransparency = 0,
+		ScaleType = Enum.ScaleType.Fit,
+	}, LogoHold)
+
+	local Glow = Custom:Create("ImageLabel", {
+		Name = "Glow",
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		Size = UDim2.new(1.6, 0, 1.6, 0),
+		Image = "rbxassetid://5028857084",
+		ImageColor3 = Cfg.Accent,
+		ImageTransparency = 0.82,
+		Visible = false, -- No decorative glow layer.
+		ZIndex = 0,
+	}, LogoHold)
+
+	local TitleLabel = Custom:Label(Center, {
+		Name = "Title",
+		LayoutOrder = 3,
+		Font = Enum.Font.GothamBold,
+		Text = tostring(Cfg.Title),
+		TextColor3 = Cfg.Text,
+		TextSize = 18,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextWrapped = true,
+		Size = UDim2.new(1, 0, 0, 24),
+	})
+
+	local SubtitleLabel = Custom:Label(Center, {
+		Name = "Subtitle",
+		LayoutOrder = 4,
+		Font = Enum.Font.Gotham,
+		Text = tostring(Cfg.Subtitle),
+		TextColor3 = Cfg.SubText,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextWrapped = true,
+		Size = UDim2.new(1, 0, 0, 16),
+		Visible = tostring(Cfg.Subtitle) ~= "",
+	})
+
+	local StatusLabel = Custom:Label(Center, {
+		Name = "Status",
+		LayoutOrder = 5,
+		Font = Enum.Font.Gotham,
+		Text = tostring(Cfg.Status),
+		TextColor3 = Cfg.SubText,
+		TextSize = 13,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		TextWrapped = true,
+		Size = UDim2.new(1, 0, 0, 18),
+	})
+
+	local ProgressBox = Custom:Create("Frame", {
+		Name = "ProgressBox",
+		LayoutOrder = 6,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(0, 220, 0, 28),
+		Visible = Cfg.Progress.Enabled,
+	}, Center)
+
+	local TrackBar = Custom:Create("Frame", {
+		Name = "Track",
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, 4),
+		Size = UDim2.new(1, 0, 0, Cfg.Progress.Height),
+		BackgroundColor3 = Cfg.ProgressTrack,
+		BorderSizePixel = 0,
+	}, ProgressBox)
+	Custom:Corner(TrackBar, math.floor(Cfg.Progress.Height / 2 + 0.5))
+	local FillBar = Custom:Create("Frame", {
+		Name = "Fill",
+		BackgroundColor3 = Cfg.ProgressColor,
+		BorderSizePixel = 0,
+		Size = UDim2.new(CurrentProgress, 0, 1, 0),
+	}, TrackBar)
+	Custom:Corner(FillBar, math.floor(Cfg.Progress.Height / 2 + 0.5))
+	if Cfg.ProgressColor == Theme.White or Cfg.ProgressColor == Color3.fromRGB(245, 245, 245) then
+		Custom:AddGradient(FillBar, 90, Custom.GradientWhite)
+	end
+
+	local PercentLabel = Custom:Label(ProgressBox, {
+		Name = "Percent",
+		Font = Enum.Font.GothamMedium,
+		Text = Cfg.Progress.ShowPercent and string.format("%d%%", math.floor(CurrentProgress * 100 + 0.5)) or "",
+		TextColor3 = Cfg.SubText,
+		TextSize = 11,
+		TextXAlignment = Enum.TextXAlignment.Center,
+		Position = UDim2.new(0, 0, 0, Cfg.Progress.Height + 8),
+		Size = UDim2.new(1, 0, 0, 14),
+		Visible = Cfg.Progress.ShowPercent,
+	})
+
+	local DiscordRow = Custom:Create("Frame", {
+		Name = "Discord",
+		AnchorPoint = Vector2.new(0.5, 1),
+		Position = UDim2.new(0.5, 0, 1, -28),
+		Size = UDim2.new(0, 320, 0, 22),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ZIndex = 6,
+		Visible = Cfg.Discord.Enabled,
+	}, Root)
+
+	local DiscordBtn = Custom:Create("TextButton", {
+		Name = "DiscordBtn",
+		Text = "",
+		AutoButtonColor = false,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 1, 0),
+	}, DiscordRow)
+
+	local DiscordInner = Custom:Create("Frame", {
+		Name = "Inner",
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0.5, 0, 0.5, 0),
+		AutomaticSize = Enum.AutomaticSize.XY,
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+	}, DiscordBtn)
+	Custom:Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Horizontal,
+		HorizontalAlignment = Enum.HorizontalAlignment.Center,
+		VerticalAlignment = Enum.VerticalAlignment.Center,
+		Padding = UDim.new(0, 6),
+		SortOrder = Enum.SortOrder.LayoutOrder,
+	}, DiscordInner)
+
+	Custom:Label(DiscordInner, {
+		Name = "Prefix",
+		Font = Enum.Font.Gotham,
+		Text = "Join Discord  ·",
+		TextColor3 = Cfg.SubText,
+		TextSize = 11,
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.new(0, 0, 0, 18),
+		LayoutOrder = 1,
+	})
+	local DiscordLinkLabel = Custom:Label(DiscordInner, {
+		Name = "Link",
+		Font = Enum.Font.GothamMedium,
+		Text = Cfg.Discord.Url ~= "" and Cfg.Discord.Url or Cfg.Discord.Text,
+		TextColor3 = Cfg.Discord.Color,
+		TextSize = 11,
+		AutomaticSize = Enum.AutomaticSize.X,
+		Size = UDim2.new(0, 0, 0, 18),
+		LayoutOrder = 2,
+	})
+
+	function Self:SetTitle(Text)
+		if Dead() then return end
+		TitleLabel.Text = tostring(Text or "")
+	end
+
+	function Self:SetSubtitle(Text)
+		if Dead() then return end
+		SubtitleLabel.Text = tostring(Text or "")
+		SubtitleLabel.Visible = SubtitleLabel.Text ~= ""
+	end
+
+	function Self:SetStatus(Text)
+		if Dead() then return end
+		StatusLabel.Text = tostring(Text or "")
+	end
+
+	function Self:SetProgress(Value, Animate)
+		if Dead() or not Cfg.Progress.Enabled then return end
+		CurrentProgress = math.clamp(tonumber(Value) or 0, 0, 1)
+		if Animate ~= false and Cfg.Animations then
+			Anim(FillBar, 0.35, { Size = UDim2.new(CurrentProgress, 0, 1, 0) })
+		else
+			FillBar.Size = UDim2.new(CurrentProgress, 0, 1, 0)
+		end
+		if Cfg.Progress.ShowPercent then
+			PercentLabel.Text = string.format("%d%%", math.floor(CurrentProgress * 100 + 0.5))
+		end
+	end
+
+	function Self:GetProgress()
+		return CurrentProgress
+	end
+
+	function Self:SetTimer(Seconds)
+		if Dead() or not Cfg.Timer.Enabled then return end
+		CurrentSeconds = math.max(0, tonumber(Seconds) or 0)
+		TimerLabel.Text = FormatTime(CurrentSeconds)
+	end
+
+	function Self:GetTimer()
+		return CurrentSeconds
+	end
+
+	function Self:StartTimer(FromSeconds)
+		if Dead() or not Cfg.Timer.Enabled then return end
+		if FromSeconds ~= nil then
+			CurrentSeconds = math.max(0, tonumber(FromSeconds) or 0)
+			TimerLabel.Text = FormatTime(CurrentSeconds)
+		end
+		if TimerRunning then return end
+		TimerRunning = true
+		task.spawn(function()
+			while TimerRunning and not Dead() do
+				task.wait(1)
+				if not TimerRunning or Dead() then break end
+				if Cfg.Timer.CountDown then
+					CurrentSeconds = math.max(0, CurrentSeconds - 1)
+				else
+					CurrentSeconds = CurrentSeconds + 1
+				end
+				TimerLabel.Text = FormatTime(CurrentSeconds)
+				if Cfg.Timer.CountDown and CurrentSeconds <= 0 then
+					TimerRunning = false
+					break
+				end
+			end
+		end)
+	end
+
+	function Self:StopTimer()
+		TimerRunning = false
+	end
+
+	function Self:SetLogo(Asset)
+		if Dead() then return end
+		LogoImg.Image = tostring(Asset or "")
+	end
+
+	function Self:SetDiscord(Url, Text)
+		if Dead() then return end
+		if type(Url) == "table" then
+			Cfg.Discord.Url = tostring(Url.Url or Url[1] or "")
+			Cfg.Discord.Text = tostring(Url.Text or Cfg.Discord.Text)
+			Cfg.Discord.Enabled = Cfg.Discord.Url ~= ""
+		else
+			Cfg.Discord.Url = tostring(Url or "")
+			if Text then Cfg.Discord.Text = tostring(Text) end
+			Cfg.Discord.Enabled = Cfg.Discord.Url ~= ""
+		end
+		DiscordRow.Visible = Cfg.Discord.Enabled
+		DiscordLinkLabel.Text = Cfg.Discord.Url ~= "" and Cfg.Discord.Url or Cfg.Discord.Text
+	end
+
+	function Self:Show()
+		if Dead() then return end
+		Gui.Enabled = true
+		Root.Visible = true
+		if Cfg.Animations then
+			Root.BackgroundTransparency = 1
+			LogoScale.Scale = 0.88
+			Anim(Root, 0.32, { BackgroundTransparency = Cfg.BackgroundTransparency })
+			Anim(LogoScale, 0.4, { Scale = 1 }, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+		else
+			Root.BackgroundTransparency = Cfg.BackgroundTransparency
+			LogoScale.Scale = 1
+		end
+	end
+
+	function Self:Hide()
+		if Dead() then return end
+		if Cfg.Animations then
+			Anim(Root, 0.25, { BackgroundTransparency = 1 })
+			Anim(LogoScale, 0.2, { Scale = 0.9 })
+			task.delay(0.28, function()
+				if not Dead() then Root.Visible = false end
+			end)
+		else
+			Root.Visible = false
+		end
+	end
+
+	function Self:Destroy(Instant)
+		if Destroyed or Closing then return end
+		Closing = true
+		TimerRunning = false
+		local function Teardown()
+			if Destroyed then return end
+			Destroyed = true
+			for _, C in ipairs(Conns) do pcall(function() C:Disconnect() end) end
+			for _, T in ipairs(Tweens) do pcall(function() T:Cancel() end) end
+			pcall(function() Gui:Destroy() end)
+			if Rexxzy_Library.ActiveKaitunGui == Self then
+				Rexxzy_Library.ActiveKaitunGui = nil
+			end
+		end
+		if Instant == true or not Cfg.Animations then
+			Teardown()
+		else
+			Anim(Root, 0.22, { BackgroundTransparency = 1 })
+			Anim(LogoScale, 0.18, { Scale = 0.88 })
+			task.delay(0.26, Teardown)
+		end
+	end
+
+	function Self:IsDestroyed()
+		return Destroyed or Closing
+	end
+
+	function Self:GetGui()
+		return Gui
+	end
+
+	Self.Gui = Gui
+	Self.Root = Root
+	Self.Frame = Center
+
+	Track(DiscordBtn.Activated:Connect(function()
+		if Dead() or not Cfg.Discord.Enabled then return end
+		local Url = Cfg.Discord.Url
+		if Url == "" then return end
+		local Fn = setclipboard or toclipboard or (Clipboard and Clipboard.set)
+		if Fn then
+			pcall(Fn, Url)
+			DiscordLinkLabel.Text = "Copied!"
+			task.delay(1.4, function()
+				if not Dead() then
+					DiscordLinkLabel.Text = Cfg.Discord.Url ~= "" and Cfg.Discord.Url or Cfg.Discord.Text
+				end
+			end)
+		end
+	end))
+	Track(DiscordBtn.MouseEnter:Connect(function()
+		if Dead() then return end
+		Anim(DiscordLinkLabel, 0.12, { TextColor3 = Cfg.Discord.Color:Lerp(Theme.White, 0.35) })
+	end))
+	Track(DiscordBtn.MouseLeave:Connect(function()
+		if Dead() then return end
+		Anim(DiscordLinkLabel, 0.18, { TextColor3 = Cfg.Discord.Color })
+	end))
+
+	if Cfg.CloseOnClick then
+		local Catcher = Custom:Create("TextButton", {
+			Name = "Catcher",
+			Text = "",
+			AutoButtonColor = false,
+			BackgroundTransparency = 1,
+			Size = UDim2.new(1, 0, 1, 0),
+			ZIndex = 2,
+		}, Root)
+		Track(Catcher.Activated:Connect(function()
+			Self:Destroy()
+		end))
+	end
+
+	if Rexxzy_Library.ActiveKaitunGui and Rexxzy_Library.ActiveKaitunGui ~= Self then
+		pcall(function() Rexxzy_Library.ActiveKaitunGui:Destroy(true) end)
+	end
+	Rexxzy_Library.ActiveKaitunGui = Self
+
+	task.defer(function()
+		if Dead() then return end
+		Self:Show()
+		if Cfg.Timer.Enabled and Cfg.Timer.Seconds > 0 and UserConfig.AutoStartTimer ~= false then
+			Self:StartTimer()
+		end
+	end)
+
+	return Self
+end
+
+return {
+	Library = Rexxzy_Library,
+	Webhook = RexxzyWebhook,
+	Logos = RexxzyLogos,
+}
